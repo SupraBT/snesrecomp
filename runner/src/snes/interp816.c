@@ -185,6 +185,7 @@ uint64_t interp816_cycles_total(void) { return s_interp816_cycles; }
  * interpreter, dumped via interp816_perf_dump(). Keyed by a 12-bit hash of
  * the full pc24 so the dump shows the precise hot instruction, not a page. */
 #define INTERP_PC_BUCKETS 4096
+#ifndef SNESRECOMP_CLEAN_BUILD
 static uint32_t s_pc_buckets[INTERP_PC_BUCKETS];
 static uint32_t s_pc24[INTERP_PC_BUCKETS];
 static uint32_t s_pc_bucket_total = 0;
@@ -194,6 +195,11 @@ static uint32_t s_oh_sample; /* 1-in-64 probe counter */
 static int s_oh_on = -1;
 #define OPCODE_HIST_BEGIN() do { uint64_t _oh_t0 = 0; if (s_oh_on < 0) { const char *_e = getenv("SNESRECOMP_INTERP_OPCODE_HIST"); s_oh_on = (_e && _e[0] && _e[0] != '0') ? 1 : 0; } int _oh_s = (s_oh_on == 1 && (s_oh_sample++ & 63u) == 0); if (_oh_s) _oh_t0 = snesrecomp_host_now_ns();
 #define OPCODE_HIST_END(_op) if (_oh_s) { uint64_t _dt = snesrecomp_host_now_ns() - _oh_t0; s_oh_count[(_op)]++; s_oh_tot[(_op)] += (uint32_t)(_dt < 0xFFFFFFFFu ? _dt : 0xFFFFFFFFu); } } while(0)
+#else
+#define OPCODE_HIST_BEGIN() do { } while(0)
+#define OPCODE_HIST_END(_op) do { } while(0)
+#endif
+#ifndef SNESRECOMP_CLEAN_BUILD
 void interp816_perf_dump(void) {
     uint32_t idx[INTERP_PC_BUCKETS];
     for (int i = 0; i < INTERP_PC_BUCKETS; i++) idx[i] = i;
@@ -244,10 +250,12 @@ void interp816_opcode_hist_dump(void) {
     memset(s_oh_count, 0, sizeof(s_oh_count));
     memset(s_oh_tot, 0, sizeof(s_oh_tot));
 }
+#endif /* !SNESRECOMP_CLEAN_BUILD (interp816 dev dumps) */
 
 int interp816_runOpcode(Interp816* cpu) {
   cpu->cyclesUsed = 0;
   s_interp816_opcodes_run++;
+#ifndef SNESRECOMP_CLEAN_BUILD
   /* getenv() walks the whole environment block on MSVC (~us) - cache it so
    * the hot path pays a branch, not a CRT call, per interpreted instruction.
    * Same value as getenv, so behaviour is bit-identical. */
@@ -265,6 +273,7 @@ int interp816_runOpcode(Interp816* cpu) {
       }
     }
   }
+#endif
   if(cpu->stopped) return 1;
 
   bool interruptPending = cpu->nmiWanted || cpu->irqWanted;

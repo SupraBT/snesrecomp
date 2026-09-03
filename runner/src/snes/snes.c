@@ -425,21 +425,15 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
       if(!snes->autoJoyRead) snes->autoJoyTimer = 0;
       snes->hIrqEnabled = val & 0x10;
       snes->vIrqEnabled = val & 0x20;
+#ifndef SNESRECOMP_CLEAN_BUILD
       { static int nmi_log = 0;
         if (nmi_log < 20) {
           fprintf(stderr, "[CPU_W] $4200=$%02X (NMI=%d IRQ_h=%d IRQ_v=%d AJR=%d)\n",
                   val, (val >> 7) & 1, (val >> 4) & 1, (val >> 5) & 1, val & 1);
           nmi_log++;
         }
-        /* Battle/field marker: log EVERY $4200 write with its frame and the
-         * current vTimer, gated by SNESRECOMP_VTRIG_LOG=1. Star Ocean turns
-         * the battle screen-loop on by enabling the vIRQ with vTimer=216; that
-         * write is the deterministic battle-start/end trigger. */
-        if (getenv("SNESRECOMP_VTRIG_LOG")) {
-          fprintf(stderr, "[vtrig] f=%d $4200=$%02X h=%d v=%d vt=%d\n",
-                  snes_frame_counter, val, (val>>4)&1, (val>>5)&1, snes->vTimer);
-        }
       }
+#endif
       snes->nmiEnabled = val & 0x80;
       if(!snes->hIrqEnabled && !snes->vIrqEnabled) {
         snes->inIrq = false;
@@ -499,6 +493,7 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
       break;
     }
     case 0x420b: {
+#ifndef SNESRECOMP_CLEAN_BUILD
       /* Log DMA triggers */
       { static int dma420b_log = 0;
         if (val != 0 && dma420b_log < 30) {
@@ -512,6 +507,7 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
           dma420b_log++;
         }
       }
+#endif
       for (int ch = 0; ch < 8; ch++) {
         if (val & (1 << ch)) {
           DmaChannel *c = &snes->dma->channel[ch];

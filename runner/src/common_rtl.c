@@ -109,11 +109,20 @@ int cosim_apu_shared_clock(void) {
 // last APU sync; rtl_accumulate_apu_catchup() converts the delta to SPC cycles.
 uint64_t g_apu_last_sync_master = 0;
 /* Production's frame loop is the stable guest-time ruler: one frame is
- * 357368 SNES master cycles and 17088 SPC cycles in this runtime's 60 Hz
- * model. g_cpu.master_cycles supplies only the within-frame position because
- * its total per frame varies with recompilation coverage. */
+ * 357368 SNES master cycles in this runtime's 60 Hz model.
+ * g_cpu.master_cycles supplies only the within-frame position because its
+ * total per frame varies with recompilation coverage.
+ *
+ * The SPC:master ratio is the true hardware fraction (SPC700 @ 1.024 MHz /
+ * SNES master @ 21.47727 MHz = 5632/118125) and is carried EXACTLY: the
+ * guest position is floor(total_master * NUM / DEN), which accumulates the
+ * fractional remainder across frames instead of truncating it per frame.
+ * The former 17088/357368 was ~0.29% fast (32097 vs 32000 SPC samples/s),
+ * drifting the SPC ahead of real hardware on long upload streams and
+ * unbalancing the audio ring in real-time zones. */
 #define RTL_MASTER_CYCLES_PER_FRAME 357368ull
-#define RTL_APU_CYCLES_PER_FRAME     17088ull
+#define RTL_APU_RATIO_NUM           5632ull
+#define RTL_APU_RATIO_DEN          118125ull
 static uint64_t g_apu_frame_start_master;
 static bool g_apu_frame_time_valid;
 
@@ -154,9 +163,9 @@ static uint64_t rtl_apu_guest_cycle(void) {
   uint64_t within = g_cpu.master_cycles - g_apu_frame_start_master;
   if (within >= RTL_MASTER_CYCLES_PER_FRAME)
     within = RTL_MASTER_CYCLES_PER_FRAME - 1;
-  return (uint64_t)snes_frame_counter * RTL_APU_CYCLES_PER_FRAME +
-         within * RTL_APU_CYCLES_PER_FRAME /
-             RTL_MASTER_CYCLES_PER_FRAME;
+  uint64_t total_master = (uint64_t)snes_frame_counter *
+                          RTL_MASTER_CYCLES_PER_FRAME + within;
+  return total_master * RTL_APU_RATIO_NUM / RTL_APU_RATIO_DEN;
 }
 // $420D bit 0 (FastROM / MEMSEL): 1 => $80-$FF:$8000-$FFFF code runs fast (6
 // master clocks/access) instead of slow (8). Tracked here so emitted blocks in
@@ -1081,6 +1090,12 @@ void rtl_accumulate_apu_catchup(void) {
 
 #ifdef SNESRECOMP_INTERP_PROFILE
 #include <time.h>
+/* ns-precision interval helper for the per-call prof counters (MSVC clock()
+ * is ~1ms-coarse, useless for short APU-port sync calls). */
+static inline double prof_ms_since(uint64_t t0) {
+    extern uint64_t snesrecomp_host_now_ns(void);
+    return (double)(snesrecomp_host_now_ns() - t0) / 1e6;
+}
 uint64_t apuw_prof_calls = 0;
 double apuw_prof_ms = 0.0;
 #endif
@@ -1138,16 +1153,16 @@ double apus_prof_ms = 0.0;
 void rtl_sync_apu_to_cpu_locked(void) {
 #ifdef SNESRECOMP_INTERP_PROFILE
   { extern uint64_t apus_prof_calls; extern double apus_prof_ms;
-    clock_t _t0 = clock();
+    uint64_t _t0 = snesrecomp_host_now_ns();
     apus_prof_calls++; }
-  clock_t _t1 = clock();
+  uint64_t _t1 = snesrecomp_host_now_ns();
 #endif
   if (!g_apu_frame_time_valid) {
     rtl_accumulate_apu_catchup();
     snes_catchupApu(g_snes);
 #ifdef SNESRECOMP_INTERP_PROFILE
     { extern uint64_t apus_prof_calls; extern double apus_prof_ms;
-      apus_prof_ms += 1000.0 * ((double)(clock() - _t1)) / CLOCKS_PER_SEC; }
+      apus_prof_ms += prof_ms_since(_t1); }
 #endif
     return;
   }
@@ -1161,7 +1176,7 @@ void rtl_sync_apu_to_cpu_locked(void) {
     fprintf(stderr, "[apu] CPU-port guest-clock sync timed out\n");
 #ifdef SNESRECOMP_INTERP_PROFILE
   { extern uint64_t apus_prof_calls; extern double apus_prof_ms;
-    apus_prof_ms += 1000.0 * ((double)(clock() - _t1)) / CLOCKS_PER_SEC; }
+    apus_prof_ms += prof_ms_since(_t1); }
 #endif
 }
 
@@ -1349,10 +1364,12 @@ static void rtl_sync_apu_frame_boundary(void) {
    * behind it: advance the real SPC through every event due by this completed
    * frame at normal speed and turbo alike. */
   uint64_t _t0 = 0;
+#ifndef SNESRECOMP_CLEAN_BUILD
   if (getenv("SNESRECOMP_PHASE_MS")) {
     extern uint64_t snesrecomp_host_now_ns(void);
     _t0 = snesrecomp_host_now_ns();
   }
+#endif
   RtlApuLock();
   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_CPU);
   uint64_t before = g_snes->apu->portClock;
@@ -1360,7 +1377,8 @@ static void rtl_sync_apu_frame_boundary(void) {
    * boundary after the completed frame; adding its stale within-frame master
    * offset here would count the frame body twice. */
   uint64_t boundary = (uint64_t)snes_frame_counter *
-                      RTL_APU_CYCLES_PER_FRAME;
+                      RTL_MASTER_CYCLES_PER_FRAME *
+                      RTL_APU_RATIO_NUM / RTL_APU_RATIO_DEN;
   bool synced = apu_runToGuestCycle(g_snes->apu, boundary,
                                     1u << 20);
   audio_trace_on_guest_sync(1, g_snes->apu->portClock - before);
@@ -1422,7 +1440,8 @@ void RtlAudioSetFastForward(bool active) {
 /* ---- Native-rate delivery with an occupancy servo ----------------------
  *
  * Two independent clocks meet here and nowhere else: the guest produces
- * exactly 534 natives per emulated frame (RTL_APU_CYCLES_PER_FRAME / 32,
+ * ~532.5 natives per emulated frame at the true SPC ratio (32 SPC cycles per
+ * sample; the old 17088/32 = 534 figure was the 0.29%-fast estimate),
  * paced by rtl_sync_apu_frame_boundary), and the host audio device drains at
  * its own crystal rate. They never agree exactly:
  *

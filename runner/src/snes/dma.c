@@ -146,12 +146,9 @@ uint8_t dma_read(Dma* dma, uint16_t adr) {
 
 void dma_write(Dma* dma, uint16_t adr, uint8_t val) {
 #if defined(SNESRECOMP_TRACE) && SNESRECOMP_TRACE
-      static int dma_reg_trace_on = -1;
-      if (dma_reg_trace_on < 0)
-          dma_reg_trace_on = getenv("SNESRECOMP_DMA_REG_TRACE") ? 1 : 0;
-      if (dma_reg_trace_on)
-        fprintf(stderr, "[dma] write $43%02x=%02x (ch=%d)\n", adr & 0xff, val,
-                (adr & 0x70) >> 4);
+  if (dma_debug_enabled())
+    fprintf(stderr, "[dma] write $43%02x=%02x (ch=%d)\n", adr & 0xff, val,
+            (adr & 0x70) >> 4);
 #endif
   uint8_t c = (adr & 0x70) >> 4;
   switch(adr & 0xf) {
@@ -392,14 +389,11 @@ void dma_startDma(Dma* dma, uint8_t val, bool hdma) {
         sdd1_dma_init(dma->snes->cart->sdd1, i,
                       ((uint32_t)ch->aBank << 16) | ch->aAdr, ch->size);
 #if defined(SNESRECOMP_TRACE) && SNESRECOMP_TRACE
-        static int sdd1_trace_on = -1;
-        if (sdd1_trace_on < 0)
-            sdd1_trace_on = getenv("SNESRECOMP_SDD1_TRACE") ? 1 : 0;
-        if (sdd1_dma_active(dma->snes->cart->sdd1, i)) {
-          if (sdd1_trace_on) fprintf(stderr, "[sdd1] DMA session armed ch=%d src=%06x size=%u\n",
+        if (dma_debug_enabled() && sdd1_dma_active(dma->snes->cart->sdd1, i)) {
+          fprintf(stderr, "[sdd1] DMA session armed ch=%d src=%06x size=%u\n",
                   i, ((uint32_t)ch->aBank << 16) | ch->aAdr, ch->size);
-        } else {
-          if (sdd1_trace_on) fprintf(stderr, "[sdd1] DMA arm REJECTED ch=%d src=%06x size=%u\n",
+        } else if (dma_debug_enabled()) {
+          fprintf(stderr, "[sdd1] DMA arm REJECTED ch=%d src=%06x size=%u\n",
                   i, ((uint32_t)ch->aBank << 16) | ch->aAdr, ch->size);
         }
 #endif

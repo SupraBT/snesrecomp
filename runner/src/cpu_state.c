@@ -459,8 +459,10 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
     if (g_snes && g_snes->cart)
         cart_note_cpu_bus(g_snes->cart, bank, addr);
     cpu->open_bus = v;
+#ifndef SNESRECOMP_CLEAN_BUILD
     if (g_wlog_active) wlog_note(bank, addr, v, 1);
     wlog_addr_note(bank, addr, v, 1);
+#endif
     int off = cpu_wram_offset(bank, addr);
     if (off >= 0) {
         uint8 old = cpu->ram[off];
@@ -534,8 +536,10 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
     if (g_snes && g_snes->cart)
         cart_note_cpu_bus(g_snes->cart, bank, addr);
     cpu->open_bus = (uint8)v;
+#ifndef SNESRECOMP_CLEAN_BUILD
     if (g_wlog_active) wlog_note(bank, addr, v, 2);
     wlog_addr_note(bank, addr, v, 2);
+#endif
     int off = cpu_wram_offset(bank, addr);
     if (off >= 0) {
         uint16 hi_addr = (uint16)(addr + 1);
