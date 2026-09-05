@@ -127,7 +127,7 @@ pub fn is_rom_address(mapping: RomMapping, bank: u32, addr: u32) -> bool {
         RomMapping::LoRom => addr >= 0x8000 && !(0x40..0x80).contains(&bank),
         RomMapping::Sdd1ExLoRom => {
             if (0xC0..=0xFF).contains(&bank) {
-                true  // full $0000-$FFFF window is ROM in ExLoROM S-DD1 banks
+                true // full $0000-$FFFF window is ROM in ExLoROM S-DD1 banks
             } else {
                 addr >= 0x8000 && !(0x40..0x80).contains(&bank)
             }
