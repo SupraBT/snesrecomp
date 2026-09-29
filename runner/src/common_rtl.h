@@ -49,8 +49,6 @@ extern uint64_t g_apu_last_sync_master;
  * Interpreter fallback must not also add its legacy relative catch-up for the
  * same elapsed master cycles. */
 bool rtl_apu_frame_timeline_active(void);
-/* Savestate support: capture/restore the host APU frame-timeline pacing anchor
- * (host-only state that must resume deterministically after a load). */
 void rtl_apu_snapshot_pacing(uint64_t *frame_start_master, uint8_t *frame_time_valid);
 void rtl_apu_restore_pacing(uint64_t frame_start_master, uint8_t frame_time_valid);
 void rtl_accumulate_apu_catchup(void);

@@ -11,6 +11,7 @@
 #include "cpu_trace.h"
 #include "debug_server.h"
 #include "cpu_state.h"
+#include "host_report.h"
 #include <setjmp.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -731,6 +732,163 @@ void WatchdogCheck(void) {
     { extern int snes_frame_counter;
       debug_server_profile_latch(snes_frame_counter); }
     longjmp(g_watchdog_jmp, 1);
+  }
+}
+
+/* ── Dev hang guard: "pantalla negra con los frames subiendo" ─────────────
+ *
+ * Un cuelgue del invitado en este runtime NO detiene el bucle de frames: el
+ * invitado sigue volviendo a su espera de vblank, `snes_frame_counter` sigue
+ * subiendo y la ventana sigue repintando; lo unico congelado es el estado del
+ * juego (screen force-blank, mismo rutina de espera una y otra vez). El
+ * watchdog normal no lo ve porque vigila frames LARGOS, no frames inutiles, y
+ * el informe de salida solo se escribe al cerrar la ventana a mano.
+ *
+ * Este guardia muestrea un frame de invitado a la vez (dos comparaciones, sin
+ * hashing) y, cuando la pantalla lleva SNESRECOMP_HANG_FRAMES frames seguidos
+ * en force-blank (por defecto 600, muy por encima de los ~124 frames que el
+ * hueco legitimo de la intro aguanta en hardware) MIENTRAS el invitado solo ha
+ * ejecutado como mucho DOS rutinas distintas (pc de reanudacion + funcion AOT)
+ * en toda la ventana, vuelca el informe completo (host_report_dump_json) mas un
+ * sidecar de texto con la espinada, la pila AOT, los registros, la pila del
+ * invitado y los ultimos valores de los puertos APU. Se escribe UNA vez por
+ * episodio, asi que una carga lenta legitima solo deja un fichero de mas.
+ *
+ * Inerte (un getenv cacheado en el primer frame) si no se define
+ * SNESRECOMP_HANG_GUARD. Ajustes:
+ *   SNESRECOMP_HANG_GUARD[=base]  base de los ficheros (def. "hang_report")
+ *   SNESRECOMP_HANG_FRAMES=<n>    frames de force-blank congelados (def. 600)
+ */
+#define HANG_GUARD_RING 96
+static int   s_hg_state = -1;          /* -1 sin init, 0 off, 1 on */
+static long  s_hg_limit = 600;
+static char  s_hg_base[512] = "hang_report";
+static long  s_hg_blank_run;           /* frames consecutivos en force-blank */
+static long  s_hg_start_frame;
+static uint32_t s_hg_key0, s_hg_key1;  /* como mucho 2 rutinas distintas */
+static int   s_hg_keys;
+static int   s_hg_reported;            /* ya volcado para este episodio */
+typedef struct HangGuardSample {
+  int frame; uint32_t pc; uint32_t key; uint8_t inidisp; uint16 pad;
+} HangGuardSample;
+static HangGuardSample s_hg_ring[HANG_GUARD_RING];
+static int s_hg_ring_n;
+
+extern const char *g_last_recomp_func;
+extern int snes_frame_counter;
+
+static void hang_guard_lazy(void) {
+  s_hg_state = 0;
+  {
+    const char *e = getenv("SNESRECOMP_HANG_GUARD");
+    if (!e || !e[0] || e[0] == '0') return;
+    if (e[0] != '1' || e[1] != '\0')
+      snprintf(s_hg_base, sizeof(s_hg_base), "%s", e);
+  }
+  {
+    const char *n = getenv("SNESRECOMP_HANG_FRAMES");
+    if (n && n[0]) { long v = strtol(n, NULL, 0); if (v >= 30) s_hg_limit = v; }
+  }
+  s_hg_state = 1;
+  fprintf(stderr, "[hang-guard] armado: %ld frames de force-blank congelado -> %s.json/.txt\n",
+          s_hg_limit, s_hg_base);
+}
+
+static uint32_t hang_guard_key(void) {
+  uint32_t pc = (uint32_t)(interp_bridge_lle_resume_pc() & 0xFFFFFFu);
+  uint32_t fn = (uint32_t)((uintptr_t)g_last_recomp_func & 0xFFFFu);
+  return (pc << 8) ^ fn;
+}
+
+static void hang_guard_report(void) {
+  char path[600];
+  /* Informe completo del runtime: estado, CPU y volcado de WRAM. */
+  snprintf(path, sizeof(path), "%s.json", s_hg_base);
+  FILE *f = fopen(path, "w");
+  if (f) { host_report_dump_json(f); fclose(f); }
+
+  snprintf(path, sizeof(path), "%s.txt", s_hg_base);
+  FILE *t = fopen(path, "w");
+  if (!t) return;
+  uint8_t ind = g_ppu ? (uint8_t)g_ppu->inidisp : 0;
+  fprintf(t, "[hang] force-blank congelado durante %ld frames de invitado\n",
+          s_hg_blank_run);
+  fprintf(t, "[hang] frames %ld..%d  inidisp=%02X  pad_actual=%04X  rutinas=%d\n",
+          s_hg_start_frame, snes_frame_counter, ind,
+          g_snes ? (unsigned)g_snes->input1_currentState : 0u, s_hg_keys);
+  fprintf(t, "[hang] guest: resume=%06X interp_pc=%06X fn=%s\n",
+          (unsigned)(interp_bridge_lle_resume_pc() & 0xFFFFFFu),
+          (unsigned)(g_interp816_cur_pc & 0xFFFFFFu),
+          g_last_recomp_func ? g_last_recomp_func : "(none)");
+  fprintf(t, "[hang] cpu: A=%04X X=%04X Y=%04X S=%04X D=%04X DB=%02X PB=%02X P=%02X m=%u x=%u emu=%u\n",
+          g_cpu.A, g_cpu.X, g_cpu.Y, g_cpu.S, g_cpu.D, g_cpu.DB, g_cpu.PB,
+          g_cpu.P, g_cpu.m_flag & 1, g_cpu.x_flag & 1, g_cpu.emulation & 1);
+  fprintf(t, "[hang] wram: E4=%02X E5=%02X DA=%02X AFB=%02X AFD=%02X%02X B01=%02X\n",
+          g_ram[0xE4], g_ram[0xE5], g_ram[0xDA], g_ram[0xAFB],
+          g_ram[0xAFE], g_ram[0xAFD], g_ram[0xB01]);
+  if (g_snes && g_snes->apu) {
+    fprintf(t, "[hang] apu: out=%02X %02X %02X %02X  in=%02X %02X %02X %02X\n",
+            g_snes->apu->outPorts[0], g_snes->apu->outPorts[1],
+            g_snes->apu->outPorts[2], g_snes->apu->outPorts[3],
+            g_snes->apu->inPorts[0], g_snes->apu->inPorts[1],
+            g_snes->apu->inPorts[2], g_snes->apu->inPorts[3]);
+  }
+  fprintf(t, "[hang] pila AOT (mas reciente primero):\n");
+  for (int i = g_recomp_stack_top - 1; i >= 0; i--)
+    fprintf(t, "    [%d] %s\n", g_recomp_stack_top - 1 - i, g_recomp_stack[i]);
+  if (g_recomp_stack_top == 0) fprintf(t, "    (vacia)\n");
+  fprintf(t, "[hang] ultimos frames (frame pc_invitado inidisp pad):\n");
+  for (int i = 0; i < s_hg_ring_n; i++) {
+    int k = (s_hg_ring_n - 1 - i) & (HANG_GUARD_RING - 1);
+    fprintf(t, "    f%-6d pc=%06X ind=%02X pad=%04X\n",
+            s_hg_ring[k].frame, (unsigned)s_hg_ring[k].pc,
+            s_hg_ring[k].inidisp, (unsigned)s_hg_ring[k].pad);
+  }
+  /* Pila del invitado (banco 0, pagina $01) — quien llama a quien. */
+  fprintf(t, "[hang] pila del invitado $0100-$01FF (offsets con contenido):\n");
+  for (int o = 0x100; o < 0x200; o += 2) {
+    unsigned w = (unsigned)g_ram[o] | ((unsigned)g_ram[o + 1] << 8);
+    if (w) fprintf(t, "    $%04X: %04X\n", o, w);
+  }
+  fclose(t);
+  fprintf(stderr, "[hang-guard] COLGUE: %ld frames en force-blank con %d rutina(s); "
+                  "volcado en %s.json / %s.txt\n",
+          s_hg_blank_run, s_hg_keys, s_hg_base, s_hg_base);
+}
+
+void hang_guard_frame_tick(void) {
+  if (s_hg_state < 0) hang_guard_lazy();
+  if (s_hg_state != 1) return;
+
+  uint8_t ind = g_ppu ? (uint8_t)g_ppu->inidisp : 0;
+  uint16_t pad = g_snes ? (uint16_t)g_snes->input1_currentState : 0;
+  uint32_t key = hang_guard_key();
+  s_hg_ring[snes_frame_counter & (HANG_GUARD_RING - 1)] =
+      (HangGuardSample){ snes_frame_counter,
+                         (uint32_t)(interp_bridge_lle_resume_pc() & 0xFFFFFFu),
+                         key, ind, pad };
+  if (s_hg_ring_n < HANG_GUARD_RING) s_hg_ring_n++;
+
+  if ((ind & 0x80) == 0) {   /* pantalla visible: episodio terminado */
+    if (s_hg_reported)
+      fprintf(stderr, "[hang-guard] la pantalla volvio a la vida en el frame %d\n",
+              snes_frame_counter);
+    s_hg_blank_run = 0; s_hg_reported = 0; s_hg_keys = 0;
+    return;
+  }
+  /* Force-blank: la rutina tiene que ser la misma (o alternar entre dos). */
+  if (s_hg_keys == 0) {
+    s_hg_key0 = key; s_hg_keys = 1; s_hg_start_frame = snes_frame_counter;
+  } else if (s_hg_keys == 1 && key != s_hg_key0) {
+    s_hg_key1 = key; s_hg_keys = 2;
+  } else if (s_hg_keys == 2 && key != s_hg_key0 && key != s_hg_key1) {
+    s_hg_key0 = key; s_hg_keys = 1;      /* tercera rutina: ventana nueva */
+    s_hg_blank_run = 0;
+  }
+  s_hg_blank_run++;
+  if (!s_hg_reported && s_hg_blank_run >= s_hg_limit) {
+    s_hg_reported = 1;
+    hang_guard_report();
   }
 }
 

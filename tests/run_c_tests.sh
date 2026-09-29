@@ -105,6 +105,15 @@ echo "=== DSP-1 bus/core shell ==="
     -o "$OUT/dsp1_firmware_test"
 "$OUT/dsp1_firmware_test"
 
+echo "=== S-DD1 decompressor (core vs bsnes, streaming vs block) ==="
+"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+    -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
+    "$ROOT/tests/sdd1/sdd1_test.c" \
+    "$ROOT/runner/src/snes/sdd1.c" \
+    "$ROOT/tests/sdd1/sdd1_bsnes_ref.c" \
+    -o "$OUT/sdd1_test"
+"$OUT/sdd1_test"
+
 echo "=== SA-1 CPU, mapping and peripherals ==="
 "$CC" -std=c11 -Wall -Wextra -Werror -O1 \
     -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \

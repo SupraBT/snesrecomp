@@ -289,7 +289,6 @@ int main(void) {
 #else
     setenv("SNESRECOMP_TIER2_JOURNAL", journal, 1);
 #endif
-    tier2_capture_set_default_enabled(1);
     RAM = malloc(MEMSZ);
 
     printf("S0 APU timeline policy remains cartridge-scoped\n");

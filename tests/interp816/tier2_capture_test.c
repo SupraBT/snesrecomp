@@ -18,34 +18,20 @@ int main(void) {
 #ifdef _WIN32
     _putenv_s("SNESRECOMP_TIER2_MANIFEST", manifest);
     _putenv_s("SNESRECOMP_TIER2_JOURNAL", journal);
-    _putenv_s("SNESRECOMP_TIER2_CAPTURE", "");
-    _putenv_s("SNESRECOMP_TIER2", "");
 #else
     setenv("SNESRECOMP_TIER2_MANIFEST", manifest, 1);
     setenv("SNESRECOMP_TIER2_JOURNAL", journal, 1);
-    unsetenv("SNESRECOMP_TIER2_CAPTURE");
-    unsetenv("SNESRECOMP_TIER2");
 #endif
-
-    CHECK(strcmp(tier2_capture_manifest_path("QA Game"), manifest) == 0,
-          "explicit manifest path changed");
-    CHECK(strcmp(tier2_capture_journal_path("QA Game"), journal) == 0,
-          "explicit journal path changed");
-    CHECK(!tier2_capture_enabled(), "tier2 capture should default off");
-    CHECK(tier2_capture_append_discovery(
-              "QA Game", 0x807000, 0xC00000, "M1X1", "dispatch", 1, 1),
-          "disabled capture should be a successful no-op");
-    FILE *disabled = fopen(journal, "r");
-    CHECK(disabled == NULL, "disabled capture created journal");
-
-    tier2_capture_set_default_enabled(1);
-    CHECK(tier2_capture_enabled(), "tier2 capture did not enable");
 
     FILE *seed = fopen(journal, "w");
     CHECK(seed != NULL, "cannot seed %s", journal);
     fputs("{\"sentinel\":true}\n", seed);
     CHECK(fclose(seed) == 0, "cannot close seed journal");
 
+    CHECK(strcmp(tier2_capture_manifest_path("QA Game"), manifest) == 0,
+          "explicit manifest path changed");
+    CHECK(strcmp(tier2_capture_journal_path("QA Game"), journal) == 0,
+          "explicit journal path changed");
     CHECK(tier2_capture_append_discovery(
               "QA Game", 0x808000, 0xC01234, "M1X1", "call_gap", 1, 12),
           "first append failed");

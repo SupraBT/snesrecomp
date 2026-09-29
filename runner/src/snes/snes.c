@@ -25,6 +25,48 @@
 int snes_frame_counter;
 static const double apuCyclesPerMaster = (32040 * 32) / (1364 * 262 * 60.0);
 
+/* ── Traza de PC por frame de INVITADO (dev, env SNESRECOMP_PC_LOG[=ruta]) ──
+ * Una línea por frontera de frame emulado (entrada de vblank), con la función
+ * AOT viva, el PC del intérprete y el PC de reanudación del puente.  Sirve para
+ * comparar la SECUENCIA de código del invitado contra un oráculo de hardware
+ * (Mesen) frame a frame: una divergencia de cadencia (p.ej. 1 nivel/frame en el
+ * recomp frente a 1 cada 4 frames en hardware) aparece como un salto de rutina
+ * en esta traza.  Coste cero cuando la variable no está definida. */
+static FILE *s_pclog_fp;
+static int   s_pclog_state = -1;   /* -1 sin inicializar, 0 off, 1 on */
+static unsigned long long s_guest_frame;
+
+extern const char *g_last_recomp_func;
+extern uint32_t g_interp816_cur_pc;
+extern uint32_t interp_bridge_lle_resume_pc(void);
+
+/* Accesor del contador de frames de INVITADO (fronteras de frame cruzadas),
+ * para la sonda SNESRECOMP_FRAME_BUDGET: mide cuantos frames de invitado
+ * consume cada frame de host. */
+unsigned long long snes_guest_frame_count(void) { return s_guest_frame; }
+
+static inline void pclog_frame_boundary(void) {
+  /* El contador de frames de invitado se lleva SIEMPRE, con o sin traza: es
+   * una magnitud del emulador (fronteras de frame cruzadas), no del log.  Si
+   * solo avanzase con SNESRECOMP_PC_LOG activo, cualquier medida que lea el
+   * contador sin la traza (p.ej. la sonda SNESRECOMP_FRAME_BUDGET) veria 0. */
+  s_guest_frame++;
+  if (s_pclog_state < 0) {
+    const char *e = getenv("SNESRECOMP_PC_LOG");
+    s_pclog_state = (e && e[0] && e[0] != '0') ? 1 : 0;
+    if (s_pclog_state == 1) {
+      const char *path = (e && e[0] && e[0] != '1') ? e : "pc_frame.log";
+      s_pclog_fp = fopen(path, "w");
+    }
+  }
+  if (s_pclog_state != 1 || !s_pclog_fp) return;
+  fprintf(s_pclog_fp, "gf=%llu hostf=%d pc=%06X resume=%06X fn=%s\n",
+          s_guest_frame, snes_frame_counter,
+          (unsigned)(g_interp816_cur_pc & 0xFFFFFFu),
+          (unsigned)(interp_bridge_lle_resume_pc() & 0xFFFFFFu),
+          g_last_recomp_func ? g_last_recomp_func : "(none)");
+}
+
 uint8_t snes_readReg(Snes* snes, uint16_t adr);
 void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val);
 
@@ -310,6 +352,7 @@ static void snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
       h = 0;
       v++;
       if (v >= 262u) v = 0;
+      if (v == 225u) pclog_frame_boundary();
     }
   }
   snes->hPos = (uint16_t)h;
@@ -425,7 +468,6 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
       if(!snes->autoJoyRead) snes->autoJoyTimer = 0;
       snes->hIrqEnabled = val & 0x10;
       snes->vIrqEnabled = val & 0x20;
-#ifndef SNESRECOMP_CLEAN_BUILD
       { static int nmi_log = 0;
         if (nmi_log < 20) {
           fprintf(stderr, "[CPU_W] $4200=$%02X (NMI=%d IRQ_h=%d IRQ_v=%d AJR=%d)\n",
@@ -433,7 +475,6 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
           nmi_log++;
         }
       }
-#endif
       snes->nmiEnabled = val & 0x80;
       if(!snes->hIrqEnabled && !snes->vIrqEnabled) {
         snes->inIrq = false;
@@ -493,7 +534,6 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
       break;
     }
     case 0x420b: {
-#ifndef SNESRECOMP_CLEAN_BUILD
       /* Log DMA triggers */
       { static int dma420b_log = 0;
         if (val != 0 && dma420b_log < 30) {
@@ -507,7 +547,6 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
           dma420b_log++;
         }
       }
-#endif
       for (int ch = 0; ch < 8; ch++) {
         if (val & (1 << ch)) {
           DmaChannel *c = &snes->dma->channel[ch];
@@ -515,7 +554,42 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
         }
       }
       dma_startDma(snes->dma, val, false);
-      while (dma_cycle(snes->dma)) {}
+      {
+        /* EXPERIMENT (dma-charge): dma_doDma models the transfer in CPU-cycle
+         * units (2 cycles per drain-loop iteration: 6 added per byte, consumed
+         * 2 at a time = the documented 8 cycles/byte - 2 overlap), but the
+         * drained cycles were never credited to the guest clock, so every
+         * DMA-heavy sequence (boot loading, S-DD1 streaming) ran ahead of real
+         * time. Count the loop iterations and charge them to the guest
+         * (CPU cycles + master = cycles * 6), keeping the beam in sync.
+         *
+         * MEASURED (2026-09-28, Star Ocean intro/menu load, replay rep_menu2):
+         * with the charge on, guest master_cycles run ~13% hot per guest frame
+         * (402-464k vs the 357,368 of one frame) and the forced-blank stretch
+         * between the intro fades grows 123 -> 185 guest frames, against 124
+         * measured on hardware (mesen_oracle.tsv pass 2: fr 718..841 blank).
+         * With the charge off the same run measures 123 - hardware-exact, as
+         * does the fade-in-1 -> fade-out distance (recomp 288 vs hardware 287).
+         * The charge was never validated against the oracle and it demonstrably
+         * pushes guest time away from it, so it stays OFF by default and is
+         * only reachable for A/B with SNESRECOMP_DMA_CHARGE=1. Only the
+         * accounting differs either way; the transfer itself always completes. */
+        static int s_dma_charge = -1;
+        if (s_dma_charge < 0) {
+          const char *_e = getenv("SNESRECOMP_DMA_CHARGE");
+          s_dma_charge = (_e && _e[0] == '1' && _e[1] == '\0') ? 1 : 0;
+        }
+        if (s_dma_charge) {
+          extern CpuState g_cpu;
+          int _dma_iters = 0;
+          while (dma_cycle(snes->dma)) { _dma_iters++; }
+          g_cpu.cycles += (uint64_t)_dma_iters * 2u;
+          g_cpu.master_cycles += (uint64_t)_dma_iters * 2u * 6u;
+          snes_sync_master_clock(snes, g_cpu.master_cycles);
+        } else {
+          while (dma_cycle(snes->dma)) { }
+        }
+      }
       break;
     }
     case 0x420c: {

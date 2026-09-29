@@ -46,10 +46,9 @@ from snes65816 import (  # noqa: E402
     ABS_X as _MODE_ABS_X, ABS_Y as _MODE_ABS_Y, IMM as _MODE_IMM,
 )
 from v2.ir import (  # noqa: E402
-    IROp, IRBlock, Value, SegKind,
+    IROp, IRBlock, Value,
     CondBranch, Goto, IndirectGoto, Call, Return,
     PullReg, PushReg, Pull, Push, PushEffectiveAddress, Reg,
-    Read, Write, IncMem, BitSetMem, BitClearMem, Break, BlockMove,
 )
 
 
@@ -59,40 +58,27 @@ def _label_for(key: DecodeKey) -> str:
     return f"L_{pc:04X}_M{key.m}X{key.x}"
 
 
-def _block_cycle_totals(pairs):
-    """Per-block static 65816 CPU cycles + opcode/operand fetch count.
+def _block_cycle_const(pairs) -> int:
+    """Static (gen-time) 65816 CPU-cycle cost of a block's instructions.
 
-    Returns (cycles, n_fetch). `cycles` folds base + M/X-width + native adds
-    via the shared cost model (snes_cycles.block_static_cycles); runtime-only
-    modifiers (D.l != 0, index page-cross, branch taken) are NOT folded here
-    — they are charged dynamically in a later step C increment. `n_fetch` is
-    the sum of opcode+operand bytes (charged at the code-region speed). The
-    DATA-transfer count is NOT derived from the IR: the charge site counts the
-    region-paced accessor calls in the ACTUAL emitted lines (they match what
-    runs exactly, including skipped trampoline pushes and inline pointer
-    reads). The master charge becomes (cycles - n_data)*6 + n_fetch*(S - 6),
-    matching the LLE's per-transfer model exactly.
+    Folds base + M/X-width + native adds via the shared cost model
+    (snes_cycles.block_static_cycles); the M/X widths come from the per-insn
+    flags the decoder already stamped. Runtime-only modifiers (D.l != 0,
+    index page-cross, branch taken) are NOT folded here — they are charged
+    dynamically in a later step C increment. Returns 0 for an empty/odd block
+    so the emitter can skip the add entirely.
     """
     items = []
-    nf_total = 0
     for p in pairs:
         insn = p[0]
         op = getattr(insn, 'opcode', None)
         if op is None:
-            return (0, 0)
-        items.append((op, getattr(insn, 'm_flag', 1),
-                      getattr(insn, 'x_flag', 1)))
-        nf_total += int(getattr(insn, 'length', 0) or 0)
+            return 0
+        items.append((op, getattr(insn, 'm_flag', 1), getattr(insn, 'x_flag', 1)))
     if not items:
-        return (0, 0)
+        return 0
     const, _dynamics = block_static_cycles(items)
-    return (const, nf_total)
-
-
-def _block_cycle_const(pairs) -> int:
-    """Back-compat wrapper: just the static CPU-cycle constant."""
-    c, _nf = _block_cycle_totals(pairs)
-    return c
+    return const
 
 
 def _block_speed(bank: int, pc: int):
@@ -123,13 +109,10 @@ def _dynamic_charge_lines(insn, speed_expr: str = "8") -> List[str]:
     Each +1 CPU-cycle charge also adds `speed_expr` master clocks (Axis-5), so
     the master-clock accumulator stays region-weighted-consistent with `cycles`.
 
-    Covered: D.l != 0 (any DP mode); write-mode index page-cross for abs,X /
-    abs,Y stores+RMW with an 8-bit index (x=1; the base is the static operand,
-    the index is the live register). With a 16-bit index (x=0) the write
-    surcharge is unconditional and folded into the block const (xwrite_add),
-    so no runtime line is emitted here. NOT yet covered (documented residual,
-    measured against bsnes): (dp),Y page-cross (runtime pointer) and MVN/MVP
-    per-byte (the static charge counts one byte).
+    Covered: D.l != 0 (any DP mode); index page-cross for abs,X / abs,Y READS
+    (the base is the static operand; the index is the live register). NOT yet
+    covered (documented residual, measured against bsnes): (dp),Y page-cross
+    (runtime pointer) and MVN/MVP per-byte (the static charge counts one byte).
     """
     op = getattr(insn, 'opcode', None)
     if op is None:
@@ -140,22 +123,19 @@ def _dynamic_charge_lines(insn, speed_expr: str = "8") -> List[str]:
         out.append(
             f"if (cpu->D & 0xFF) {{ cpu->cycles += 1; "
             f"cpu->master_cycles += {speed_expr}; }}  /* D.l != 0 */")
-    if 'xcross' in charges and (getattr(insn, 'x_flag', 1) & 1):
-        # Write-mode indexed store/RMW with an 8-bit index: the LLE charges
-        # +1 only when the effective address crosses a page. With x=0 the
-        # charge is unconditional and already folded into the block const.
+    if 'xcross' in charges:
         mode = getattr(insn, 'mode', None)
         base = getattr(insn, 'operand', 0) & 0xFFFF
         if mode == _MODE_ABS_X:
             out.append(
                 f"if ((0x{base:04X} & 0xFF00) != ((0x{base:04X} + cpu->X) & 0xFF00))"
                 f" {{ cpu->cycles += 1; cpu->master_cycles += {speed_expr}; }}"
-                f"  /* abs,X write page-cross */")
+                f"  /* abs,X read page-cross */")
         elif mode == _MODE_ABS_Y:
             out.append(
                 f"if ((0x{base:04X} & 0xFF00) != ((0x{base:04X} + cpu->Y) & 0xFF00))"
                 f" {{ cpu->cycles += 1; cpu->master_cycles += {speed_expr}; }}"
-                f"  /* abs,Y write page-cross */")
+                f"  /* abs,Y read page-cross */")
         # INDIR_Y (dp),Y: effective pointer is loaded at runtime from DP — not
         # reconstructable from the static operand; left as a measured residual.
     return out
@@ -2137,39 +2117,14 @@ def emit_function(rom: bytes, bank: int, start: int,
         # (D.l/page-cross/branch-taken) are charged dynamically in block_lines.
         # Axis-5: also charge the region-weighted MASTER clocks (CPU cycles x
         # code-region speed) into cpu->master_cycles, which paces the SPC700.
-        _cyc_const, _nfetch_const = _block_cycle_totals(
-            block_per_insn_ir.get(key, []))
-        # N_data counted from the ACTUAL emitted lines (the region-paced
-        # accessor calls), not the IR: this automatically matches exactly what
-        # runs — including trampoline-setup pushes whose emit is skipped and
-        # IR ops with inline pointer reads. 8-bit call = 1 transfer, 16-bit
-        # call = 2 transfers (the paced accessors charge exactly that).
-        _ndata_const = 0
-        for _ln in block_lines[key]:
-            _ndata_const += (_ln.count('cpu_read8_paced(')
-                              + _ln.count('cpu_write8_paced('))
-            _ndata_const += 2 * (_ln.count('cpu_read16_paced(')
-                                 + _ln.count('cpu_write16_paced('))
+        _cyc_const = _block_cycle_const(block_per_insn_ir.get(key, []))
         if _cyc_const:
             src.append(f'    cpu->cycles += {_cyc_const};')
             _spd_expr, _spd_const = _block_speed(bank, key.pc)
-            # Region-paced master model (2026-08-31): the block const charges
-            # ONLY fetch + internal cycles — fetch at the code-region speed S,
-            # internal at 6. Every data/stack/pointer transfer is paced at its
-            # region speed at runtime by the cpu_*_paced accessors, so the
-            # block charge is (cycles - n_data)*6 + n_fetch*(S - 6). For code
-            # at speed 6 this is (cycles - n_data)*6; for slow code (S=8) the
-            # second term keeps the fetch weighting correct. Matches the LLE's
-            # per-transfer accounting exactly (validated to the cycle).
             if _spd_const is not None:
-                src.append(
-                    f'    cpu->master_cycles += '
-                    f'{(_cyc_const - _ndata_const) * 6} '
-                    f'+ {_nfetch_const * (_spd_const - 6)};')
+                src.append(f'    cpu->master_cycles += {_cyc_const * _spd_const};')
             else:
-                src.append(
-                    f'    cpu->master_cycles += {_cyc_const - _ndata_const} * 6 '
-                    f'+ {_nfetch_const} * ({_spd_expr} - 6);')
+                src.append(f'    cpu->master_cycles += {_cyc_const} * {_spd_expr};')
         for ln in block_lines[key]:
             # Inject RecompStackPop before any return so the stack stays balanced.
             stripped = ln.strip()

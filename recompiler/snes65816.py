@@ -13,12 +13,6 @@ from typing import Optional, List
 
 ROM_MAP_LOROM = 'lorom'
 ROM_MAP_HIROM = 'hirom'
-ROM_MAP_SDD1_EXLOROM = 'sdd1_exlorom'
-# S-DD1 MMC default page per 1MB window (banks C0-CF, D0-DF, E0-EF, F0-FF).
-# These mirror the reset values of $4804-$4807; code in banks C0-FF executes
-# with the cartridge in this default state (Star Ocean keeps window 0, page 0
-# for its code banks).
-SDD1_MMC_DEFAULT_PAGES = (0, 1, 2, 3)
 _active_rom_mapping = ROM_MAP_LOROM
 
 # Reloc regions: WRAM-executed code whose bytes live elsewhere in the ROM image
@@ -75,24 +69,15 @@ def _header_score(data: bytes, base: int, expected_low_nibble: int) -> int:
 
 
 def detect_rom_mapping(data: bytes) -> str:
-    """Detect standard LoROM versus HiROM from their internal headers.
-
-    A LoROM-header ROM larger than 4 MiB cannot be addressed by plain LoROM
-    ($8000-$FFFF in banks 00-3F/80-BF caps at 4 MiB) and must be an ExLoROM
-    S-DD1 cart (e.g. Star Ocean, 6 MiB): banks C0-FF expose the ROM through
-    the S-DD1 MMC with default pages 0,1,2,3."""
+    """Detect standard LoROM versus HiROM from their internal headers."""
     lorom_score = _header_score(data, 0x7FC0, 0)
     hirom_score = _header_score(data, 0xFFC0, 1)
-    if hirom_score > lorom_score:
-        return ROM_MAP_HIROM
-    if len(data) > 0x400000:
-        return ROM_MAP_SDD1_EXLOROM
-    return ROM_MAP_LOROM
+    return ROM_MAP_HIROM if hirom_score > lorom_score else ROM_MAP_LOROM
 
 
 def set_rom_mapping(mapping: str) -> None:
     global _active_rom_mapping
-    if mapping not in (ROM_MAP_LOROM, ROM_MAP_HIROM, ROM_MAP_SDD1_EXLOROM):
+    if mapping not in (ROM_MAP_LOROM, ROM_MAP_HIROM):
         raise ValueError(f"unsupported ROM mapping: {mapping}")
     _active_rom_mapping = mapping
 
@@ -126,16 +111,6 @@ def rom_offset(bank: int, addr: int) -> int:
         return reloc
     assert bank not in (0x7E, 0x7F), (
         f"address ${bank:02X}:{addr:04X} is WRAM, not ROM")
-    if _active_rom_mapping == ROM_MAP_SDD1_EXLOROM:
-        if 0xC0 <= bank <= 0xFF:
-            # S-DD1 MMC: banks C0-FF are four 1MB windows selected by
-            # $4804-$4807 (default pages 0,1,2,3). Code lives in window 0
-            # (banks C0-CF, page 0) — the ExLoROM canonical layout. This
-            # matches the runner's sdd1_mmc_linear() and bsnes-plus.
-            page = SDD1_MMC_DEFAULT_PAGES[(bank >> 4) & 3]
-            addr24 = (bank << 16) | addr
-            return (page << 20) | (addr24 & 0xFFFFF)
-        # Banks 00-3F/80-BF fall through to the standard LoROM window below.
     if _active_rom_mapping == ROM_MAP_HIROM:
         canonical_bank = bank & 0x7F
         assert canonical_bank >= 0x40 or addr >= 0x8000, (
@@ -153,11 +128,6 @@ def is_rom_address(bank: int, addr: int) -> bool:
         return True
     if bank in (0x7E, 0x7F):
         return False
-    if _active_rom_mapping == ROM_MAP_SDD1_EXLOROM:
-        if 0xC0 <= bank <= 0xFF:
-            # Full $0000-$FFFF window is ROM in ExLoROM S-DD1 banks.
-            return True
-        return addr >= 0x8000 and ((bank & 0xFF) < 0x40 or bank >= 0x80)
     if _active_rom_mapping == ROM_MAP_HIROM:
         canonical_bank = bank & 0x7F
         return canonical_bank >= 0x40 or addr >= 0x8000

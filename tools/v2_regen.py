@@ -374,23 +374,6 @@ def _emit_dispatch_table(out_dir: pathlib.Path, parsed,
         f"(unsigned)(sizeof(g_dispatch_table) / sizeof(g_dispatch_table[0]));"
     )
     disp_lines.append('')
-    # RAM-routine guards: the runner (cpu_state.c) requires this symbol to be
-    # defined by the generated dispatch. The full-manifest path emits it from
-    # program_emit.emit_dispatch_table(); the --banks partial path must emit
-    # the same contract so the build links. No RAM routines are declared in
-    # the current cfgs, so a sentinel-only row matches the full path's output
-    # for an empty guard set (fail-safe: any $7E/$7F dispatch row is refused
-    # at runtime, which is exactly the safe floor).
-    disp_lines.append('const RamRoutineGuard g_ram_routine_guards[] = {')
-    disp_lines.append('    { 0xFFFFFFFFu, 0u, 0u },')
-    disp_lines.append('};')
-    disp_lines.append('')
-    disp_lines.append(
-        'const unsigned g_ram_routine_guard_count = '
-        '(unsigned)(sizeof(g_ram_routine_guards) / '
-        'sizeof(g_ram_routine_guards[0]));'
-    )
-    disp_lines.append('')
     write_if_changed(disp_path, '\n'.join(disp_lines) + '\n')
     print(f"  emitted dispatch table with {len(sorted_pc24s)} entries -> {disp_path}")
 

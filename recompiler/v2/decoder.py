@@ -41,7 +41,7 @@ if str(_RECOMPILER_DIR) not in sys.path:
     sys.path.insert(0, str(_RECOMPILER_DIR))
 
 from snes65816 import (  # noqa: E402
-    decode_insn, lorom_offset, is_rom_address, Insn,
+    decode_insn, lorom_offset, Insn,
     ABS, INDIR, INDIR_X, LONG, IMM,
 )
 
@@ -481,7 +481,7 @@ def _autorecover_local_stride_runway(rom: bytes, bank: int, func_start: int,
         return None
 
     def read8(pc16: int) -> Optional[int]:
-        if not is_rom_address(bank, pc16):
+        if not (0x8000 <= pc16 <= 0xFFFF):
             return None
         try:
             off = lorom_offset(bank, pc16)
@@ -1240,7 +1240,7 @@ def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
     budget = 0
     while budget < 96:
         budget += 1
-        if not is_rom_address(bank, pc):
+        if not (0x8000 <= pc <= 0xFFFF):
             return None
         try:
             off = lorom_offset(bank, pc)
@@ -1371,7 +1371,7 @@ def classify_dispatch_helper(rom: bytes, bank: int, addr: int):
     safety = 0
     while safety < 256:
         safety += 1
-        if not is_rom_address(bank, pc):
+        if not (0x8000 <= pc <= 0xFFFF):
             return None
         try:
             offset = lorom_offset(bank, pc)
@@ -1780,8 +1780,8 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
             if boundary not in graph.boundary_exits:
                 graph.boundary_exits.append(boundary)
             continue
-        if not is_rom_address(bank, pc):
-            # Out-of-window reference; surface upstream by skipping here.
+        if not (0x8000 <= pc <= 0xFFFF):
+            # Out-of-bank reference; surface upstream by skipping here.
             continue
         if _addr_in_data_regions(data_regions, bank, pc):
             graph.data_region_exec_pcs.add(key.pc & 0xFFFFFF)

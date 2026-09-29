@@ -176,27 +176,23 @@ def take_rejected_call_targets() -> set:
 
 
 def _is_invalid_lorom_call_target(addr_24: int) -> bool:
-    """True when addr_24 cannot be a valid ROM code target.
+    """True when addr_24 cannot be a valid LoROM code target.
 
-    Mapping-aware (LoROM / HiROM / S-DD1 ExLoROM). Structural
-    rejections, both independent of any cfg directive:
-      1. The (bank, pc) pair falls outside the active cartridge
-         mapping's ROM window — e.g. LoROM pc < $8000 (RAM/registers)
-         or an ExLoROM bank outside the C0-FF full-window region.
-      2. The mapped physical offset is beyond the ROM image extent.
+    Two structural rejections, both independent of any cfg directive:
+      1. pc < $8000 — LoROM addresses $00-$7F:$0000-$7FFF are
+         RAM/registers, never ROM code. (Mirrors at $80-$BF too.)
+      2. (canonical_bank * $8000 + pc - $8000) >= rom_size — target
+         byte is beyond the ROM image extent.
 
     With _ROM_SIZE unset (== 0) we only apply rule 1 to stay safe in
     unit-test contexts that don't load a ROM.
     """
-    bank = (addr_24 >> 16) & 0xFF
     pc = addr_24 & 0xFFFF
-    if not is_rom_address(bank, pc):
+    if pc < 0x8000:
         return True
     if _ROM_SIZE > 0:
-        try:
-            offset = rom_offset(bank, pc)
-        except AssertionError:
-            return True
+        canon_bank = (addr_24 >> 16) & 0x7F
+        offset = canon_bank * 0x8000 + (pc - 0x8000)
         if offset >= _ROM_SIZE:
             return True
     return False
@@ -421,7 +417,7 @@ from v2.ir import (  # noqa: E402
     Transfer, XBA, Nop, Break, Stop, PushEffectiveAddress,
     Reg, SegRef, SegKind, Value,
 )
-from snes65816 import INDIR, INDIR_X, is_rom_address, rom_offset  # noqa: E402
+from snes65816 import INDIR, INDIR_X  # noqa: E402
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -519,7 +515,7 @@ def _segref_addr_expr(seg: SegRef) -> tuple:
     if k == SegKind.DP_INDIRECT:
         # ((D + dp) word) (+ Y if indirect-Y), DB-bank.
         ptr_addr = f"(uint16)(cpu->D + {seg.offset:#06x})"
-        return ("cpu->DB", f"(uint16)(cpu_read16_paced(cpu, 0x00, {ptr_addr}){idx})")
+        return ("cpu->DB", f"(uint16)(cpu_read16(cpu, 0x00, {ptr_addr}){idx})")
     if k == SegKind.DP_INDIRECT_LONG:
         # ((D + dp) long) (+ Y).  The indexed form adds Y to the full
         # 24-bit pointer, including carry into the bank.  Keeping the pointer's
@@ -527,31 +523,31 @@ def _segref_addr_expr(seg: SegRef) -> tuple:
         # crossing.  DKC2's decompressor exposed this with [$34],Y where
         # $DF:D537 + $2AC9 must read $E0:0000, not $DF:0000.
         ptr_addr = f"(uint16)(cpu->D + {seg.offset:#06x})"
-        bank_expr = f"cpu_read8_paced(cpu, 0x00, (uint16)({ptr_addr} + 2))"
+        bank_expr = f"cpu_read8(cpu, 0x00, (uint16)({ptr_addr} + 2))"
         if seg.index is None:
-            return (bank_expr, f"cpu_read16_paced(cpu, 0x00, {ptr_addr})")
+            return (bank_expr, f"cpu_read16(cpu, 0x00, {ptr_addr})")
         idx_reg = "cpu->X" if seg.index == Reg.X else "cpu->Y"
         base24 = (f"(((uint32){bank_expr} << 16) | "
-                  f"(uint32)cpu_read16_paced(cpu, 0x00, {ptr_addr}))")
+                  f"(uint32)cpu_read16(cpu, 0x00, {ptr_addr}))")
         eff24 = f"({base24} + (uint32){idx_reg})"
         return (f"(uint8)(({eff24}) >> 16)", f"(uint16)({eff24})")
     if k == SegKind.ABS_INDIRECT:
         return ("cpu->PB",
-                f"cpu_read16_paced(cpu, cpu->PB, (uint16){seg.offset:#06x})")
+                f"cpu_read16(cpu, cpu->PB, (uint16){seg.offset:#06x})")
     if k == SegKind.ABS_INDIRECT_X:
         return ("cpu->PB",
-                f"cpu_read16_paced(cpu, cpu->PB, (uint16)({seg.offset:#06x} + cpu->X))")
+                f"cpu_read16(cpu, cpu->PB, (uint16)({seg.offset:#06x} + cpu->X))")
     if k == SegKind.ABS_INDIRECT_LONG:
         addr = f"(uint16){seg.offset:#06x}"
-        return (f"cpu_read8_paced(cpu, 0x00, (uint16)({addr} + 2))",
-                f"cpu_read16_paced(cpu, 0x00, {addr})")
+        return (f"cpu_read8(cpu, 0x00, (uint16)({addr} + 2))",
+                f"cpu_read16(cpu, 0x00, {addr})")
     if k == SegKind.DP_INDIRECT_X:
         ptr_addr = f"(uint16)(cpu->D + {seg.offset:#06x} + cpu->X)"
-        return ("cpu->DB", f"cpu_read16_paced(cpu, 0x00, {ptr_addr})")
+        return ("cpu->DB", f"cpu_read16(cpu, 0x00, {ptr_addr})")
     if k == SegKind.STACK_REL_INDIRECT_Y:
         ptr_addr = f"(uint16)(cpu->S + {seg.offset:#06x})"
         return ("cpu->DB",
-                f"(uint16)(cpu_read16_paced(cpu, 0x00, {ptr_addr}) + cpu->Y)")
+                f"(uint16)(cpu_read16(cpu, 0x00, {ptr_addr}) + cpu->Y)")
     raise ValueError(f"unsupported SegKind {k}")
 
 
@@ -1363,8 +1359,8 @@ def _emit_indirect_dispatch(insn) -> List[str]:
     # tail transfer.
     if is_jsr:
         _iret16 = (site_pc24 + 2) & 0xFFFF  # JSR (abs,X) is 3 bytes; push return-1
-        lines.append(f"  cpu_write8_paced(cpu, 0x00, cpu->S, 0x{(_iret16 >> 8) & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);")
-        lines.append(f"  cpu_write8_paced(cpu, 0x00, cpu->S, 0x{_iret16 & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);")
+        lines.append(f"  cpu_write8(cpu, 0x00, cpu->S, 0x{(_iret16 >> 8) & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);")
+        lines.append(f"  cpu_write8(cpu, 0x00, cpu->S, 0x{_iret16 & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);")
         lines.append("  cpu->host_return_valid = 2;  /* indirect JSR call, 2-byte frame */")
     elif is_call:
         # PEA already pushed the return frame; enter the handler as a paired
@@ -1398,12 +1394,12 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         ]
         if getattr(insn, 'dispatch_stack_pointer', False):
             lines.append(
-                f"  uint16 _target = (uint16)(cpu_read16_paced(cpu, 0x00, "
+                f"  uint16 _target = (uint16)(cpu_read16(cpu, 0x00, "
                 f"(uint16)(cpu->D + 0x{ptr:04x})) + 1u);"
                 "  /* PEI(dp); RTS consumes target-1 as an internal goto */")
         else:
             lines.append(
-                f"  uint16 _target = cpu_read16_paced(cpu, cpu->PB, (uint16)0x{ptr:04x});"
+                f"  uint16 _target = cpu_read16(cpu, cpu->PB, (uint16)0x{ptr:04x});"
                 "  /* absolute indirect dispatch: switch on the loaded pointer */")
         lines.append("  switch (_target) {")
         seen_cases = set()
@@ -1449,17 +1445,17 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                 f"  uint16 _ptr = (uint16)(0x{ptr:04x} + (cpu->{idx_field} & 0xFFFF));"
                 "  /* long pointer descriptor selected at runtime */")
             lines.append(
-                "  uint16 _target_lo = cpu_read16_paced(cpu, 0x00, _ptr);")
+                "  uint16 _target_lo = cpu_read16(cpu, 0x00, _ptr);")
             lines.append(
-                "  uint8 _target_bank = cpu_read8_paced(cpu, 0x00, (uint16)(_ptr + 2));")
+                "  uint8 _target_bank = cpu_read8(cpu, 0x00, (uint16)(_ptr + 2));")
             lines.append(
                 "  uint32 _target = ((uint32)_target_bank << 16) | (uint32)_target_lo;"
                 "  /* switch on the loaded long pointer */")
         elif kind == 'long':
             lines.append(
-                f"  uint16 _target_lo = cpu_read16_paced(cpu, 0x00, (uint16)0x{ptr:04x});")
+                f"  uint16 _target_lo = cpu_read16(cpu, 0x00, (uint16)0x{ptr:04x});")
             lines.append(
-                f"  uint8 _target_bank = cpu_read8_paced(cpu, 0x00, (uint16)(0x{ptr:04x} + 2));")
+                f"  uint8 _target_bank = cpu_read8(cpu, 0x00, (uint16)(0x{ptr:04x} + 2));")
             lines.append(
                 "  uint32 _target = ((uint32)_target_bank << 16) | (uint32)_target_lo;"
                 "  /* absolute long-indirect dispatch: switch on the loaded pointer */"
@@ -1469,11 +1465,11 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                 f"  uint16 _ptr = (uint16)(0x{ptr:04x} + (cpu->{idx_field} & 0xFFFF));"
                 "  /* JSR (abs,X): X selects a runtime pointer descriptor */")
             lines.append(
-                "  uint16 _target = cpu_read16_paced(cpu, cpu->PB, _ptr);"
+                "  uint16 _target = cpu_read16(cpu, cpu->PB, _ptr);"
                 "  /* switch on the loaded pointer */")
         else:
             lines.append(
-                f"  uint16 _target = cpu_read16_paced(cpu, cpu->PB, (uint16)0x{ptr:04x});"
+                f"  uint16 _target = cpu_read16(cpu, cpu->PB, (uint16)0x{ptr:04x});"
                 "  /* absolute indirect dispatch: switch on the loaded pointer */"
             )
         if is_rts_stack_dispatch:
@@ -1818,7 +1814,7 @@ def _emit_runtime_dispatch(insn) -> List[str]:
     return [
         f"{{ /* runtime indirect dispatch JSR (${base:04X},{idx_field}): "
         f"per-object WRAM function pointer, resolved + dispatched at run time */",
-        f"  uint16 _disp_ptr = cpu_read16_paced(cpu, cpu->PB, "
+        f"  uint16 _disp_ptr = cpu_read16(cpu, cpu->PB, "
         f"(uint16)(0x{base:04x}u + (uint16)(cpu->{idx_field} & 0xFFFFu)));",
         f"  RecompReturn _disp_r = cpu_dispatch_call_pc(cpu, "
         f"((uint32)cpu->PB << 16) | (uint32)_disp_ptr, 0x{site_pc24:06x}u);",
@@ -1997,16 +1993,16 @@ def _emit_return_frame_push(op: 'Call') -> List[str]:
         pbr = ((site >> 16) & 0xFF) if site is not None else 0xFF
         return [
             "  /* JSL return frame -> cpu->S (Option-1) */",
-            f"  cpu_write8_paced(cpu, 0x00, cpu->S, 0x{pbr:02x}); cpu->S = (uint16)(cpu->S - 1);",
-            f"  cpu_write8_paced(cpu, 0x00, cpu->S, 0x{(ret16 >> 8) & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
-            f"  cpu_write8_paced(cpu, 0x00, cpu->S, 0x{ret16 & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
+            f"  cpu_write8(cpu, 0x00, cpu->S, 0x{pbr:02x}); cpu->S = (uint16)(cpu->S - 1);",
+            f"  cpu_write8(cpu, 0x00, cpu->S, 0x{(ret16 >> 8) & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
+            f"  cpu_write8(cpu, 0x00, cpu->S, 0x{ret16 & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
             "  cpu->host_return_valid = 3;  /* paired host caller, JSL frame */",
         ]
     ret16 = ((site + 2) & 0xFFFF) if site is not None else 0xFFFF
     return [
         "  /* JSR return frame -> cpu->S (Option-1) */",
-        f"  cpu_write8_paced(cpu, 0x00, cpu->S, 0x{(ret16 >> 8) & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
-        f"  cpu_write8_paced(cpu, 0x00, cpu->S, 0x{ret16 & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
+        f"  cpu_write8(cpu, 0x00, cpu->S, 0x{(ret16 >> 8) & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
+        f"  cpu_write8(cpu, 0x00, cpu->S, 0x{ret16 & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
         "  cpu->host_return_valid = 2;  /* paired host caller, JSR frame */",
     ]
 
@@ -2260,7 +2256,7 @@ def _emit_return(op: Return) -> List[str]:
         # I_NMI/I_IRQ invocation; without that push this over-pops cpu->S.
         return [
             "cpu_trace_event(cpu, 0, CPU_TR_RTI, 0, 0);",
-            "{ cpu->S = (uint16)(cpu->S + 1); cpu->P = cpu_read8_paced(cpu, 0x00, cpu->S); cpu_p_to_mirrors(cpu);",
+            "{ cpu->S = (uint16)(cpu->S + 1); cpu->P = cpu_read8(cpu, 0x00, cpu->S); cpu_p_to_mirrors(cpu);",
             "  cpu->S = (uint16)(cpu->S + 2);  /* pull + discard PC */",
             "  if (!cpu->emulation) cpu->S = (uint16)(cpu->S + 1);  /* native: pull + discard PB */",
             "  cpu_trace_px_record(cpu, 0, 3 /*RTI*/, cpu->P, cpu->P);",
@@ -2291,13 +2287,13 @@ def _emit_return(op: Return) -> List[str]:
     lines = [
         f"{{ uint16 _ret_s = cpu->S;  /* {label_inner} pop hardware return frame */",
         "  cpu->S = (uint16)(cpu->S + 1);",
-        "  uint16 _rpcl = (uint16)cpu_read8_paced(cpu, 0x00, cpu->S);",
+        "  uint16 _rpcl = (uint16)cpu_read8(cpu, 0x00, cpu->S);",
         "  cpu->S = (uint16)(cpu->S + 1);",
-        "  uint16 _rpch = (uint16)cpu_read8_paced(cpu, 0x00, cpu->S);",
+        "  uint16 _rpch = (uint16)cpu_read8(cpu, 0x00, cpu->S);",
     ]
     if op.long:
         lines.append("  cpu->S = (uint16)(cpu->S + 1);")
-        lines.append("  uint8 _rpb = cpu_read8_paced(cpu, 0x00, cpu->S);")
+        lines.append("  uint8 _rpb = cpu_read8(cpu, 0x00, cpu->S);")
     else:
         lines.append("  uint8 _rpb = cpu->PB;")
     # Frame size this RTS/RTL pops (RTS = 2 bytes, RTL = 3). The dispatch
@@ -2462,16 +2458,16 @@ def _emit_pea_per_pei(op: PushEffectiveAddress) -> List[str]:
         return [
             "{ uint16 _old_s = cpu->S;",
             "  cpu->S = (uint16)(cpu->S - 1);",
-            f"  cpu_write16_paced(cpu, 0x00, cpu->S, (uint16){op.seg.offset:#06x});",
+            f"  cpu_write16(cpu, 0x00, cpu->S, (uint16){op.seg.offset:#06x});",
             "  cpu->S = (uint16)(cpu->S - 1);",
             "  cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PEA, _old_s, -2); }",
         ]
     if op.seg.kind == SegKind.DP_INDIRECT:
         return [
             "{ uint16 _old_s = cpu->S;",
-            f"  uint16 _peival = cpu_read16_paced(cpu, 0x00, (uint16)(cpu->D + {op.seg.offset:#06x}));",
+            f"  uint16 _peival = cpu_read16(cpu, 0x00, (uint16)(cpu->D + {op.seg.offset:#06x}));",
             "  cpu->S = (uint16)(cpu->S - 1);",
-            "  cpu_write16_paced(cpu, 0x00, cpu->S, _peival);",
+            "  cpu_write16(cpu, 0x00, cpu->S, _peival);",
             "  cpu->S = (uint16)(cpu->S - 1);",
             "  cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PEI, _old_s, -2); }",
         ]
@@ -2499,8 +2495,8 @@ def _emit_blockmove(op: BlockMove) -> List[str]:
         "   * A/X/Y/DB state. The block's static charge covers the first byte;",
         "   * each repeated byte costs another seven CPU cycles. */",
         "  do {",
-        "    uint8 _b = cpu_read8_paced(cpu, _src_b, cpu->X);",
-        "    cpu_write8_paced(cpu, _dst_b, cpu->Y, _b);",
+        "    uint8 _b = cpu_read8(cpu, _src_b, cpu->X);",
+        "    cpu_write8(cpu, _dst_b, cpu->Y, _b);",
         f"    cpu->X = (uint16)(cpu->X {delta});",
         f"    cpu->Y = (uint16)(cpu->Y {delta});",
         "    if (cpu->x_flag) { cpu->X &= 0x00FFu; cpu->Y &= 0x00FFu; }",

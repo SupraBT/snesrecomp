@@ -130,16 +130,11 @@ bool rtl_apu_frame_timeline_active(void) {
   return g_apu_frame_time_valid;
 }
 
-/* Host APU frame-timeline pacing state, exported for the L3SN savestate. The
- * frame-timeline anchor must be serialized alongside the APU port pacing so a
- * load resumes with exactly the pacing the save had; otherwise the first
- * post-load port write re-anchors against stale pre-save values and its target
- * lands hundreds of millions of SPC cycles in the future (hung handshake /
- * non-deterministic resume). Host-only: neither function touches guest state. */
 void rtl_apu_snapshot_pacing(uint64_t *frame_start_master, uint8_t *frame_time_valid) {
   if (frame_start_master) *frame_start_master = g_apu_frame_start_master;
-  if (frame_time_valid)   *frame_time_valid   = g_apu_frame_time_valid ? 1 : 0;
+  if (frame_time_valid) *frame_time_valid = g_apu_frame_time_valid ? 1 : 0;
 }
+
 void rtl_apu_restore_pacing(uint64_t frame_start_master, uint8_t frame_time_valid) {
   g_apu_frame_start_master = frame_start_master;
   g_apu_frame_time_valid = frame_time_valid != 0;
@@ -553,6 +548,11 @@ bool RtlRunFrame(uint32 inputs) {
 #endif
 
   snes_frame_counter++;
+  /* Dev hang guard (env SNESRECOMP_HANG_GUARD): "black screen with the frame
+   * counter still rising" leaves no trace otherwise — the frame loop is healthy
+   * while the guest spins on a flag that never arrives. One env-gated call per
+   * guest frame; see hang_guard_frame_tick in common_cpu_infra.c. */
+  { extern void hang_guard_frame_tick(void); hang_guard_frame_tick(); }
   /* Every runner client gets the same guest-frame/APU coupling. Presentation
    * code may opt into fast-forward PCM recovery separately, but cannot omit
    * the emulation clock. */
@@ -1090,12 +1090,6 @@ void rtl_accumulate_apu_catchup(void) {
 
 #ifdef SNESRECOMP_INTERP_PROFILE
 #include <time.h>
-/* ns-precision interval helper for the per-call prof counters (MSVC clock()
- * is ~1ms-coarse, useless for short APU-port sync calls). */
-static inline double prof_ms_since(uint64_t t0) {
-    extern uint64_t snesrecomp_host_now_ns(void);
-    return (double)(snesrecomp_host_now_ns() - t0) / 1e6;
-}
 uint64_t apuw_prof_calls = 0;
 double apuw_prof_ms = 0.0;
 #endif
@@ -1153,16 +1147,16 @@ double apus_prof_ms = 0.0;
 void rtl_sync_apu_to_cpu_locked(void) {
 #ifdef SNESRECOMP_INTERP_PROFILE
   { extern uint64_t apus_prof_calls; extern double apus_prof_ms;
-    uint64_t _t0 = snesrecomp_host_now_ns();
+    clock_t _t0 = clock();
     apus_prof_calls++; }
-  uint64_t _t1 = snesrecomp_host_now_ns();
+  clock_t _t1 = clock();
 #endif
   if (!g_apu_frame_time_valid) {
     rtl_accumulate_apu_catchup();
     snes_catchupApu(g_snes);
 #ifdef SNESRECOMP_INTERP_PROFILE
     { extern uint64_t apus_prof_calls; extern double apus_prof_ms;
-      apus_prof_ms += prof_ms_since(_t1); }
+      apus_prof_ms += 1000.0 * ((double)(clock() - _t1)) / CLOCKS_PER_SEC; }
 #endif
     return;
   }
@@ -1176,7 +1170,7 @@ void rtl_sync_apu_to_cpu_locked(void) {
     fprintf(stderr, "[apu] CPU-port guest-clock sync timed out\n");
 #ifdef SNESRECOMP_INTERP_PROFILE
   { extern uint64_t apus_prof_calls; extern double apus_prof_ms;
-    apus_prof_ms += prof_ms_since(_t1); }
+    apus_prof_ms += 1000.0 * ((double)(clock() - _t1)) / CLOCKS_PER_SEC; }
 #endif
 }
 
@@ -1364,12 +1358,10 @@ static void rtl_sync_apu_frame_boundary(void) {
    * behind it: advance the real SPC through every event due by this completed
    * frame at normal speed and turbo alike. */
   uint64_t _t0 = 0;
-#ifndef SNESRECOMP_CLEAN_BUILD
   if (getenv("SNESRECOMP_PHASE_MS")) {
     extern uint64_t snesrecomp_host_now_ns(void);
     _t0 = snesrecomp_host_now_ns();
   }
-#endif
   RtlApuLock();
   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_CPU);
   uint64_t before = g_snes->apu->portClock;
@@ -1385,6 +1377,39 @@ static void rtl_sync_apu_frame_boundary(void) {
   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
   if (!synced)
     fprintf(stderr, "[apu] frame-boundary guest-clock sync timed out\n");
+  /* Recorte del exceso de colchon (2026-09-29, ENCICLOPEDIA §22.11).
+   *
+   * El anillo del DSP tiene 8192 natives y el colchon objetivo son 4 bloques
+   * (2136, los mismos RTL_AUDIO_TARGET_NATIVES del servo). Cuando un tramo de
+   * invitado produce de golpe mas de lo que el dispositivo drena (medido: el
+   * burst de arranque dejo el anillo en ~5.500 y el del logo lo empujo a
+   * 7.610 con prod/s = 40.151), el servo solo puede recuperarlo al +/-0,5%
+   * (165 natives/s) => tarda medio minuto en volver al objetivo, y mientras
+   * tanto cualquier burst nuevo rebosa el anillo: eso eran los 5.897
+   * descartes de los que 393 eran audibles (~9 ms, el unico evento audible
+   * que quedaba).
+   *
+   * El recorte devuelve el colchon a su objetivo descartando lo mas ANTIGUO
+   * de la cola (que en ese momento es latencia pura, audio de hace ~150 ms) y
+   * con la rampa de recuperacion ya existente el empalme no tiene escalon, en
+   * vez de perder lo mas NUEVO de golpe al rebosar. Es auto-limitado: solo
+   * actua mientras el colchon supere el doble del objetivo, y no toca la
+   * produccion ni el reloj del invitado (audio_trace_on_fast_forward_discard
+   * lo contabiliza aparte de los drops, para poder medirlo). */
+  {
+    const uint32_t kTarget = 2136u;   /* = RTL_AUDIO_TARGET_NATIVES */
+    uint32_t avail = dsp_available(g_snes->apu->dsp);
+    if (avail > kTarget * 2u) {
+      uint32_t discarded = dsp_trimSamples(g_snes->apu->dsp, kTarget);
+      if (discarded != 0) {
+        audio_trace_on_fast_forward_discard(
+            discarded, dsp_available(g_snes->apu->dsp));
+        g_audio_recovery_anchor_l = g_audio_last_output_l;
+        g_audio_recovery_anchor_r = g_audio_last_output_r;
+        g_audio_recovery_remaining = RTL_AUDIO_RECOVERY_RAMP;
+      }
+    }
+  }
   RtlApuUnlock();
   if (_t0) {
     extern uint64_t snesrecomp_host_now_ns(void);
@@ -1470,7 +1495,29 @@ void RtlAudioSetFastForward(bool active) {
  * clock and let audio drift behind video after turbo. The consumer bending by
  * half a percent cannot become a clock.
  */
-#define RTL_AUDIO_NATIVE_RATE    32040.0 /* SPC output rate: 1.024 MHz / 32   */
+/* Tasa NATIVA real del DSP, derivada de las MISMAS constantes con las que
+ * rtl_apu_guest_cycle() produce (§22.11):
+ *
+ *   master = RTL_MASTER_CYCLES_PER_FRAME * 60 (modelo 60 Hz)
+ *   SPC    = master * RTL_APU_RATIO_NUM / RTL_APU_RATIO_DEN
+ *   natives= SPC / 32
+ *
+ * El valor estaba escrito a mano como 32040 (el comentario decia "1.024 MHz /
+ * 32", que son 32000), mientras que el productor entrega ~31944 natives/s con
+ * la fraccion exacta de hardware. Esa diferencia del 0,3% (32040 - 31944 =
+ * 96 natives/s) hace que el consumidor drene SIEMPRE mas de lo que se produce:
+ * el anillo del DSP queda vacio, `need = span+2 = 535` no se alcanza nunca y el
+ * callback marca underflow en CADA llamada (medido: output_underflows +60/s
+ * durante toda la intro con el anillo casi vacio) => SILENCIO aunque el SPC
+ * este produciendo. Derivarlo de las constantes del productor impide que las
+ * dos tasas vuelvan a separarse.
+ *
+ * Con esto el servo consume natives a 31944/32040 = 0,99707 por muestra de
+ * dispositivo: la produccion y el consumo coinciden de media (mismo razonamiento
+ * que el productor) y la afinacion resultante queda ~5 cents alta, inaudible. */
+#define RTL_AUDIO_NATIVE_RATE                                                \
+  ((double)RTL_MASTER_CYCLES_PER_FRAME * 60.0 * (double)RTL_APU_RATIO_NUM / \
+   (double)RTL_APU_RATIO_DEN / 32.0)
 #define RTL_AUDIO_TARGET_NATIVES 2136u /* 4 native blocks, ~67 ms cushion */
 #define RTL_AUDIO_SERVO_GAIN     0.05  /* gentle: full-scale error -> 5%, clamped */
 #define RTL_AUDIO_SERVO_MAX      0.005 /* +/-0.5% == ~8 cents, inaudible        */

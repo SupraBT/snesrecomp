@@ -96,9 +96,7 @@ renderer in `ppu_legacy.c` does not implement host-overlay extraction.
 This port leaves the engine's existing widescreen layer-policy controls
 (`PpuSetWidescreenLayerClamp`/`Mirror`/`Repeat`, the clamp/repeat bands, the
 margin gap, the BG3 widen/HUD-split, and the Mode-2 layer capture) fully intact;
-overlay extraction is an orthogonal, independently opt-in capability. The
-clamp/mirror/repeat layer policies are applied by the new renderer; the legacy
-renderer stores those policy fields but does not consult them while drawing.
+overlay extraction is an orthogonal, independently opt-in capability.
 
 ## Attribution
 

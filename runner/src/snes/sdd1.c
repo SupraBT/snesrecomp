@@ -33,6 +33,50 @@ static int sdd1_debug_enabled(void) {
     return v;
 }
 
+/* ---- Instrumento: bytes servidos por el chip (dev, opt-in) --------------
+ * SNESRECOMP_SDD1STATS=<ruta> (por defecto sdd1_stats.log): una linea por frame
+ * con actividad, con los bytes que el chip entrego ese frame por sus dos vias
+ * (DMA en streaming y lectura directa de la ventana MMC).
+ *
+ * Para que sirve: en los tramos de carga la unica diferencia fisica entre
+ * hardware y recomp es la TASA del chip.  La duracion de una transferencia es
+ * (bytes x ciclos-por-byte), asi que sin el recuento de bytes la tasa no se
+ * puede derivar de una medida; con el, sale de dividir los ciclos de invitado
+ * medidos en hardware entre los bytes que el invitado pide.  Coste cero
+ * mientras la variable no este definida. */
+static FILE *s_sdd1_stats_fp = NULL;
+static int   s_sdd1_stats_state = -1;
+static unsigned long long s_sdd1_bytes_dma = 0, s_sdd1_bytes_cpu = 0;
+static int   s_sdd1_stats_frame = -1;
+
+static void sdd1_stats_bytes(int via) {
+    if (s_sdd1_stats_state < 0) {
+        const char *e = getenv("SNESRECOMP_SDD1STATS");
+        s_sdd1_stats_state = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (s_sdd1_stats_state == 1) {
+            const char *p = (e && e[0] && e[0] != '1') ? e : "sdd1_stats.log";
+            s_sdd1_stats_fp = fopen(p, "w");
+            if (s_sdd1_stats_fp) setvbuf(s_sdd1_stats_fp, NULL, _IONBF, 0);
+        }
+    }
+    if (s_sdd1_stats_state != 1 || !s_sdd1_stats_fp) return;
+    {
+        extern int snes_frame_counter;
+        if (snes_frame_counter != s_sdd1_stats_frame) {
+            if (s_sdd1_stats_frame >= 0 &&
+                (s_sdd1_bytes_dma || s_sdd1_bytes_cpu))
+                fprintf(s_sdd1_stats_fp,
+                        "f%-6d dma=%-9llu cpu=%-9llu total=%llu\n",
+                        s_sdd1_stats_frame, s_sdd1_bytes_dma, s_sdd1_bytes_cpu,
+                        s_sdd1_bytes_dma + s_sdd1_bytes_cpu);
+            s_sdd1_stats_frame = snes_frame_counter;
+            s_sdd1_bytes_dma = s_sdd1_bytes_cpu = 0;
+        }
+    }
+    if (via == 0) s_sdd1_bytes_dma++;
+    else          s_sdd1_bytes_cpu++;
+}
+
 /* ---- bsnes run_count[256] table (from sdd1emu.cpp) ---- */
 
 static const uint8_t run_count_table[256] = {
@@ -720,6 +764,7 @@ uint8_t sdd1_dma_get_byte(Sdd1* sdd1, int channel) {
     /* Return next byte from decompressed buffer */
     if (state->decomp_pos < state->decomp_buf_size) {
         uint8_t val = state->decomp_buf[state->decomp_pos++];
+        sdd1_stats_bytes(0);
         state->bytes_remaining--;
         if (state->bytes_remaining == 0) {
             state->active = false;
@@ -729,6 +774,7 @@ uint8_t sdd1_dma_get_byte(Sdd1* sdd1, int channel) {
     }
 
     /* Buffer exhausted but bytes_remaining > 0: return 0 */
+    sdd1_stats_bytes(0);
     state->bytes_remaining--;
     if (state->bytes_remaining == 0) {
         state->active = false;
@@ -892,6 +938,7 @@ bool sdd1_cpu_read(Sdd1 *sdd1, uint32_t addr24, uint8_t *data) {
         /* Return next decompressed byte */
         if (sdd1->cpu_ch[i].buf_pos < sdd1->cpu_ch[i].buf_size) {
             *data = sdd1->cpu_ch[i].buf[sdd1->cpu_ch[i].buf_pos++];
+            sdd1_stats_bytes(1);
             if (sdd1->cpu_ch[i].buf_pos >= sdd1->cpu_ch[i].buf_size) {
                 /* Transfer complete — free buffer, disarm channel */
                 free(sdd1->cpu_ch[i].buf);

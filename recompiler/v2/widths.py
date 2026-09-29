@@ -187,18 +187,10 @@ def low_byte(field: str) -> str:
 # module. New emitters must call `widths.read_fn(width)` etc.
 
 def read_fn(width: int) -> str:
-    """C function name for a width-bound memory read.
-
-    Region-paced variants (2026-08-31): the AOT charges master clocks per
-    data transfer at the region speed, so DATA accesses use the _paced
-    accessors (the block const excludes data transfers). The interpreter
-    path never calls these — it uses the bridge shims with the plain
-    accessors. Fetches are not emitted as calls (baked into the block
-    const), so no fetch ever uses these.
-    """
-    return "cpu_read8_paced" if width == 1 else "cpu_read16_paced"
+    """C function name for a width-bound memory read."""
+    return "cpu_read8" if width == 1 else "cpu_read16"
 
 
 def write_fn(width: int) -> str:
-    """C function name for a width-bound memory write (region-paced)."""
-    return "cpu_write8_paced" if width == 1 else "cpu_write16_paced"
+    """C function name for a width-bound memory write."""
+    return "cpu_write8" if width == 1 else "cpu_write16"

@@ -142,12 +142,10 @@ not a stripped-down solution to a problem it doesn't.
 
 ### 3a. Operating model — live in Production, decaying instability
 
-Tier 2 fallback is **available in every config, Production included.** It is the
+Tier 2 is **always-on in every config, Production included.** It is the
 shipped runtime floor: a guest control-flow target the static pass hasn't
 covered tiers down to the interpreter and the game keeps running (perhaps with a
-glitch) instead of hard-failing. Promotion artifact capture is separate and
-opt-in: set `RtlGameInfo.tier2_capture` for a title/build, or launch with
-`SNESRECOMP_TIER2_CAPTURE=1` during developer coverage runs.
+glitch) instead of hard-failing.
 
 The instability of crossing the interp↔AOT bridge at runtime (§6) is **knowingly
 accepted, as a transient that the feedback loop actively retires:**
@@ -459,16 +457,17 @@ discoveries become cfg seeds, the next regen makes them Tier 1.
 
 - **Vendor** LakeSnes `cpu.{c,h}` under `runner/src/snes/` (or `lib/lakesnes/`),
   add to `runner/runner.cmake` and `src/*.vcxproj` source lists. C, no new deps.
-- **Gating:** Tier 2 fallback is a correctness floor and should remain available
-  in all configs including Production|x64, unlike the `SNESRECOMP_TRACE` debug
-  rings. The interpreter core is small and never runs unless a trap fires, so it
-  has no steady-state cost.
-- **Manifest recording is opt-in promotion telemetry, NOT a release default.**
-  It is independent of `SNESRECOMP_TRACE`: when enabled with
-  `RtlGameInfo.tier2_capture` or `SNESRECOMP_TIER2_CAPTURE=1`, the recorder
-  keeps a growable in-memory set of (site, target, mx, hit_count), writes a
-  small JSON on exit, and appends first sightings to a JSONL journal. When not
-  enabled, release runs do not create `tier2_*.json` or `tier2_*.jsonl`.
+- **Gating:** Tier 2 is a correctness floor — it should be **always-on in all
+  configs including Production|x64**, unlike the `SNESRECOMP_TRACE` debug rings.
+  The interpreter core is small and never runs unless a trap fires, so it has no
+  steady-state cost.
+- **Manifest recording must be its own lightweight always-on path, NOT gated
+  behind `SNESRECOMP_TRACE`.** Trace (the 2 GB debug rings) is excluded from
+  Production (`smw.vcxproj`); but since Production runs are now the primary
+  coverage-harvesting source (§3a), the trap→manifest recorder has to live in
+  the shipped build. Keep it cheap: a growable in-memory set of
+  (site, target, mx, hit_count) flushed to a small JSON next to the save dir on
+  exit. The heavy trace rings stay dev-only; only this slim recorder ships.
 - Keep the strict `_STUB_MARKERS` build-error default for shipped titles; the
   "tier-down instead of fail" relaxation is an opt-in cfg/regen flag used during
   bring-up.
@@ -528,19 +527,19 @@ discoveries become cfg seeds, the next regen makes them Tier 1.
   (`cpu_trace.c`) into `interp_bridge_run` (push a sentinel return frame, then
   run), compile `interp816.c` + `interp_bridge.c` into one game build, and
   owner-playtest. First time the bridge carries a real game.
-- **Phase 2 — manifest recording. ✅ DONE.** Opt-in tier-down coverage
+- **Phase 2 — manifest recording. ✅ DONE.** Always-on tier-down coverage
   table in `interp_bridge.c` keyed by (site, target, m/x), tracking
   clean-return vs contained-bail counts + frame span, with a resolved-landing
   capture (an indirect-goto records the *dynamically resolved* target, not the
   JMP site). `Tier2CoverageDumpJson` embeds it in the unified post-mortem
-  (`last_run_report.json`); when capture is enabled, normal exit writes a unique
-  per-run `tier2_<rom>_<UTC>_p<PID>.json` (schema
-  "snesrecomp tier2 coverage v1"). Every distinct tuple is also flushed
-  immediately to the matching append-only `.jsonl` journal, so a crash or later
-  run cannot erase the set. Capture is controlled by `RtlGameInfo.tier2_capture`
-  or `SNESRECOMP_TIER2_CAPTURE=1`, not by `SNESRECOMP_TRACE`. Recording adds no
-  signature change → no regen, runtime rebuild only. Interp harness still
-  17/17 + 20/20.
+  (`last_run_report.json`); normal exit writes a unique per-run
+  `tier2_<rom>_<UTC>_p<PID>.json` (schema "snesrecomp tier2 coverage v1").
+  Every distinct tuple is also flushed immediately to the matching append-only
+  `.jsonl` journal, so a crash or later run cannot erase the set. Wired into
+  SM's always-on `recomp_post_mortem_dump` (so it harvests on
+  normal exit, atexit, SEH crash, and on-demand TCP — not gated behind
+  `SNESRECOMP_TRACE`). Recording adds no signature change → no regen, runtime
+  rebuild only. Interp harness still 17/17 + 20/20.
 - **Phase 3 — profile-guided AOT + offline audit. ✅ DONE.** The
   manifest-driven emitter accepts repeatable `--profile-manifest` inputs.
   Clean-only target/MX observations become optional AOT roots and participate

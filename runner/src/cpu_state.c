@@ -306,6 +306,137 @@ static uint16 s_last_hw_addr = 0;
 static int s_last_hw_was_read = 0;
 static int s_apu_writes_logged = 0;
 
+/* Traza de puertos APU ($2140-$2143), dev y opt-in
+ * (SNESRECOMP_APU_PORT_RW=<ruta>, por defecto apu_port_rw.log). El motor de
+ * sonido del juego sube bancos de BRR al SPC por estos puertos: ~900 escrituras
+ * y ~8000 lecturas por frame en el trace de Mesen durante los fundidos de la
+ * intro. Sin esta traza no se ve si el invitado del recomp hace ese handshake
+ * (SNESRECOMP_WLOG_ADDR sólo registra escrituras de memoria, no de registro).
+ * Coste cero cuando la variable no está definida. */
+static FILE *s_apu_rw_fp;
+static int s_apu_rw_state = -1;
+
+extern CpuState g_cpu;
+
+static void apu_port_rw_log(uint16 addr, int is_read, uint16 val) {
+    if (s_apu_rw_state < 0) {
+        const char *e = getenv("SNESRECOMP_APU_PORT_RW");
+        s_apu_rw_state = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (s_apu_rw_state == 1) {
+            const char *path = (e && e[0] && e[0] != '1') ? e : "apu_port_rw.log";
+            s_apu_rw_fp = fopen(path, "w");
+            if (s_apu_rw_fp) setvbuf(s_apu_rw_fp, NULL, _IONBF, 0);
+        }
+    }
+    if (s_apu_rw_state != 1 || !s_apu_rw_fp) return;
+    extern int snes_frame_counter;
+    extern const char *g_last_recomp_func;
+    fprintf(s_apu_rw_fp, "f%-6d %c $%04X=%02X master=%llu %s\n",
+            snes_frame_counter, is_read ? 'R' : 'W', addr, (unsigned)(val & 0xFF),
+            (unsigned long long)g_cpu.master_cycles,
+            g_last_recomp_func ? g_last_recomp_func : "(none)");
+}
+
+/* Conteo de LECTURAS por frame de rangos de registros de hardware, dev y
+ * opt-in: SNESRECOMP_RDCOUNT="4800-4807,4212-4213" (hex, sin $) y, opcional,
+ * SNESRECOMP_RDCOUNT_FILE=<ruta> (por defecto rd_count.log).
+ * Un bucle de espera del invitado es una ronda de LECTURAS ("¿ya está listo?"):
+ * el reparto de estas por frame es lo que dice si la espera se cumplió entera o
+ * se agotó antes de tiempo, cosa que WLOG_ADDR (sólo escrituras) no ve. El
+ * código AOT lee registros por cpu_read8/cpu_read16 igual que el intérprete, así
+ * que estos dos enganches cubren las dos rutas. Coste cero sin la variable. */
+#define RDCOUNT_MAX_RANGES 6
+#define RDCOUNT_MAX_SPAN   16
+
+typedef struct {
+    uint16 lo, hi;
+    unsigned cnt[RDCOUNT_MAX_SPAN];
+    uint16 last[RDCOUNT_MAX_SPAN];
+} RdCountRange;
+
+static RdCountRange s_rdc[RDCOUNT_MAX_RANGES];
+static int s_rdc_nr = 0;
+static FILE *s_rdc_fp = NULL;
+static int s_rdc_state = -1;
+static int s_rdc_frame = -1;
+static const char *s_rdc_lastfn = NULL;
+
+static void rdcount_flush(void) {
+    if (!s_rdc_fp || s_rdc_frame < 0) return;
+    int any = 0;
+    for (int r = 0; r < s_rdc_nr && !any; r++) {
+        int span = s_rdc[r].hi - s_rdc[r].lo;
+        for (int i = 0; i <= span; i++)
+            if (s_rdc[r].cnt[i]) { any = 1; break; }
+    }
+    if (any) {
+        fprintf(s_rdc_fp, "f%-6d master=%llu %s", s_rdc_frame,
+                (unsigned long long)g_cpu.master_cycles,
+                s_rdc_lastfn ? s_rdc_lastfn : "(none)");
+        for (int r = 0; r < s_rdc_nr; r++) {
+            int span = s_rdc[r].hi - s_rdc[r].lo;
+            for (int i = 0; i <= span; i++)
+                if (s_rdc[r].cnt[i])
+                    fprintf(s_rdc_fp, " $%04X=%u/%02X", s_rdc[r].lo + i,
+                            s_rdc[r].cnt[i], s_rdc[r].last[i] & 0xFF);
+        }
+        fputc('\n', s_rdc_fp);
+    }
+    for (int r = 0; r < s_rdc_nr; r++) {
+        int span = s_rdc[r].hi - s_rdc[r].lo;
+        for (int i = 0; i <= span; i++) { s_rdc[r].cnt[i] = 0; s_rdc[r].last[i] = 0; }
+    }
+    s_rdc_lastfn = NULL;
+}
+
+static void rdcount_log(uint16 addr, uint16 val) {
+    if (s_rdc_state < 0) {
+        const char *e = getenv("SNESRECOMP_RDCOUNT");
+        s_rdc_state = 0;
+        if (e && e[0] && e[0] != '0') {
+            const char *fpath = getenv("SNESRECOMP_RDCOUNT_FILE");
+            s_rdc_fp = fopen((fpath && fpath[0]) ? fpath : "rd_count.log", "w");
+            if (s_rdc_fp) {
+                char buf[256];
+                char *p;
+                setvbuf(s_rdc_fp, NULL, _IONBF, 0);
+                snprintf(buf, sizeof buf, "%s", e);
+                p = buf;
+                while (p && *p && s_rdc_nr < RDCOUNT_MAX_RANGES) {
+                    char *comm = strchr(p, ',');
+                    unsigned lo = 0, hi = 0;
+                    if (comm) *comm = 0;
+                    if (sscanf(p, "%x-%x", &lo, &hi) == 2 && hi >= lo &&
+                        (hi - lo) < RDCOUNT_MAX_SPAN) {
+                        s_rdc[s_rdc_nr].lo = (uint16)lo;
+                        s_rdc[s_rdc_nr].hi = (uint16)hi;
+                        s_rdc_nr++;
+                    }
+                    p = comm ? comm + 1 : NULL;
+                }
+                fprintf(s_rdc_fp, "# rdcount: %d rango(s) de <%s>\n", s_rdc_nr, e);
+                if (s_rdc_nr > 0) s_rdc_state = 1;
+            }
+        }
+    }
+    if (s_rdc_state != 1 || !s_rdc_fp) return;
+    for (int r = 0; r < s_rdc_nr; r++) {
+        if (addr < s_rdc[r].lo || addr > s_rdc[r].hi) continue;
+        extern int snes_frame_counter;
+        extern const char *g_last_recomp_func;
+        int i;
+        if (s_rdc_frame != snes_frame_counter) {
+            if (s_rdc_frame >= 0) rdcount_flush();
+            s_rdc_frame = snes_frame_counter;
+        }
+        i = (int)addr - s_rdc[r].lo;
+        s_rdc[r].cnt[i]++;
+        s_rdc[r].last[i] = val;
+        s_rdc_lastfn = g_last_recomp_func;
+        return;
+    }
+}
+
 /* Logger reachable from generated code. Disabled at release. */
 void cpu_dbg_funcname(const char *name) {
     (void)name;
@@ -324,6 +455,10 @@ static void cpu_hw_log(uint16 addr, int is_read, uint16 val) {
     if (!is_read && addr >= 0x2140 && addr <= 0x2143) {
         s_apu_writes_logged++;
     }
+    if (!is_read && addr >= 0x2140 && addr <= 0x2143)
+        apu_port_rw_log(addr, 0, val);
+    /* Las lecturas de $2140-$2143 se registran en cpu_read8/16, que sí conocen
+     * el valor devuelto (aquí val siempre llega 0 en el camino de lectura). */
     s_hw_touch_count++;
 #if BUILD_CPU_HW_LOG
     (void)val;
@@ -354,7 +489,10 @@ uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
     if (is_hw_reg(bank, addr)) {
         cpu_pace_cycles(addr);
         cpu_hw_log(addr, 1, 0);
-        return cpu_latch_read8(cpu, ReadRegOpenBus(addr, cpu->open_bus));
+        uint8 v = ReadRegOpenBus(addr, cpu->open_bus);
+        if (addr >= 0x2140 && addr <= 0x2143) apu_port_rw_log(addr, 1, v);
+        rdcount_log(addr, v);
+        return cpu_latch_read8(cpu, v);
     }
     if (g_snes && g_snes->cart && g_snes->cart->type == CART_SUPERFX)
         return cpu_latch_read8(cpu, cart_read(g_snes->cart, bank, addr));
@@ -396,11 +534,17 @@ uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr) {
         uint8 hi;
         cpu_pace_cycles_word(addr);
         cpu_hw_log(addr, 1, 0);
-        if (addr >= 0x2140 && addr <= 0x217F)
-            return cpu_latch_read16(cpu, ReadRegWord(addr));
+        if (addr >= 0x2140 && addr <= 0x217F) {
+            uint16 w = ReadRegWord(addr);
+            if (addr >= 0x2140 && addr <= 0x2143)
+                apu_port_rw_log(addr, 1, (uint16)(w & 0xFF));
+            rdcount_log(addr, w);
+            return cpu_latch_read16(cpu, w);
+        }
         lo = ReadRegOpenBus(addr, cpu->open_bus);
         cpu->open_bus = lo;
         hi = ReadRegOpenBus((uint16)(addr + 1), cpu->open_bus);
+        rdcount_log(addr, (uint16)lo | ((uint16)hi << 8));
         return cpu_latch_read16(cpu, (uint16)lo | ((uint16)hi << 8));
     }
     if (g_snes && g_snes->cart && g_snes->cart->type == CART_SUPERFX) {
@@ -459,10 +603,8 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
     if (g_snes && g_snes->cart)
         cart_note_cpu_bus(g_snes->cart, bank, addr);
     cpu->open_bus = v;
-#ifndef SNESRECOMP_CLEAN_BUILD
     if (g_wlog_active) wlog_note(bank, addr, v, 1);
     wlog_addr_note(bank, addr, v, 1);
-#endif
     int off = cpu_wram_offset(bank, addr);
     if (off >= 0) {
         uint8 old = cpu->ram[off];
@@ -536,10 +678,8 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
     if (g_snes && g_snes->cart)
         cart_note_cpu_bus(g_snes->cart, bank, addr);
     cpu->open_bus = (uint8)v;
-#ifndef SNESRECOMP_CLEAN_BUILD
     if (g_wlog_active) wlog_note(bank, addr, v, 2);
     wlog_addr_note(bank, addr, v, 2);
-#endif
     int off = cpu_wram_offset(bank, addr);
     if (off >= 0) {
         uint16 hi_addr = (uint16)(addr + 1);

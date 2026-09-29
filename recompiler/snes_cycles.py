@@ -276,29 +276,16 @@ def dp_add(op: int) -> int:
     return 1 if mode in _DP_MODES else 0
 
 
-# Write-mode indexed addressing: stores and RMW in abs,X / abs,Y / (dp),Y.
-# The LLE (interp816_adrAbx/adrAby/adrIdy) charges +1 when `!xf || page-cross`
-# on WRITES only; reads (LDA/LDY/LDX/ALU in the same modes) never pay a
-# page-cross in this engine. When x=0 (16-bit index) `!xf` makes the charge
-# unconditional, so it folds into the static count (xwrite_add); when x=1 the
-# page-cross term stays runtime (xcross_add).
-_WRITE_INDEXED_OPS = {0x91, 0x99, 0x9D, 0x9E, 0x1E, 0x3E, 0x5E, 0x7E, 0xDE, 0xFE}
-
-
-def xwrite_add(op: int) -> int:
-    """+1 CPU cycle for write-mode indexed addressing with a 16-bit index
-    (x=0): the LLE's `!xf` term of `!xf || page-cross` is unconditional."""
-    return 1 if op in _WRITE_INDEXED_OPS else 0
-
-
 def xcross_add(op: int) -> int:
-    """Cycles added when the index crosses a 256-byte page, for write-mode
-    indexed addressing (stores/RMW in abs,X / abs,Y / (dp),Y) with an 8-bit
-    index (x=1). Reads never pay a page-cross in this LLE, so they return 0.
-    """
+    """Cycles added when an index crosses a 256-byte page (read ops only)."""
     if op in _SPECIAL_BASE:
         return 0
-    return 1 if op in _WRITE_INDEXED_OPS else 0
+    mn, mode = _info(op)
+    if mode not in _XCROSS_MODES:
+        return 0
+    if mn in _STORE_MNEMS:
+        return 0                        # stores pay a fixed cost, no cross add
+    return 1
 
 
 def branch_class(op: int) -> int:
@@ -408,7 +395,6 @@ def instr_static_cycles(op: int, m_flag: int = 1, x_flag: int = 1,
         c += m_add(op)
     if x_flag == 0:
         c += x_add(op)
-        c += xwrite_add(op)
     if e == 0:
         c += e_add(op)
     return c

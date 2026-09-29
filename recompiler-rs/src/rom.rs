@@ -13,10 +13,6 @@ pub enum RomMapping {
     #[default]
     LoRom,
     HiRom,
-    /// ExLoROM S-DD1 cart (e.g. Star Ocean, 6 MiB): banks C0-FF expose the
-    /// ROM through the S-DD1 MMC with default pages 0,1,2,3 ($4804-$4807
-    /// reset values). Banks 00-3F/80-BF behave like standard LoROM.
-    Sdd1ExLoRom,
 }
 
 fn header_score(data: &[u8], base: usize, expected_low_nibble: u8) -> i32 {
@@ -44,11 +40,6 @@ pub fn detect_rom_mapping(data: &[u8]) -> RomMapping {
     let hirom_score = header_score(data, 0xFFC0, 1);
     if hirom_score > lorom_score {
         RomMapping::HiRom
-    } else if data.len() > 0x400000 {
-        // A LoROM-header image larger than 4 MiB cannot be addressed by plain
-        // LoROM (banks 00-3F/80-BF cap at 4 MiB) and must be an ExLoROM S-DD1
-        // cart: banks C0-FF use the S-DD1 MMC with default pages 0,1,2,3.
-        RomMapping::Sdd1ExLoRom
     } else {
         RomMapping::LoRom
     }
@@ -56,7 +47,7 @@ pub fn detect_rom_mapping(data: &[u8]) -> RomMapping {
 
 pub fn vector_table_offset(data: &[u8]) -> usize {
     match detect_rom_mapping(data) {
-        RomMapping::LoRom | RomMapping::Sdd1ExLoRom => 0x7FE0,
+        RomMapping::LoRom => 0x7FE0,
         RomMapping::HiRom => 0xFFE0,
     }
 }
@@ -93,19 +84,6 @@ pub fn rom_offset(mapping: RomMapping, bank: u32, addr: u32) -> usize {
     );
     match mapping {
         RomMapping::LoRom => lorom_offset(bank, addr),
-        RomMapping::Sdd1ExLoRom => {
-            if (0xC0..=0xFF).contains(&bank) {
-                // S-DD1 MMC: banks C0-FF are four 1MB windows selected by
-                // $4804-$4807 (default pages 0,1,2,3). Code lives in window 0
-                // (banks C0-CF, page 0) — the ExLoROM canonical layout. This
-                // matches the runner's sdd1_mmc_linear() and bsnes-plus.
-                let page = [0usize, 1, 2, 3][((bank >> 4) & 3) as usize];
-                let addr24 = (bank << 16) | addr;
-                (page << 20) | (addr24 as usize & 0xFFFFF)
-            } else {
-                lorom_offset(bank, addr)
-            }
-        }
         RomMapping::HiRom => {
             let canonical_bank = bank & 0x7F;
             assert!(
@@ -125,13 +103,6 @@ pub fn is_rom_address(mapping: RomMapping, bank: u32, addr: u32) -> bool {
     }
     match mapping {
         RomMapping::LoRom => addr >= 0x8000 && !(0x40..0x80).contains(&bank),
-        RomMapping::Sdd1ExLoRom => {
-            if (0xC0..=0xFF).contains(&bank) {
-                true // full $0000-$FFFF window is ROM in ExLoROM S-DD1 banks
-            } else {
-                addr >= 0x8000 && !(0x40..0x80).contains(&bank)
-            }
-        }
         RomMapping::HiRom => (bank & 0x7F) >= 0x40 || addr >= 0x8000,
     }
 }

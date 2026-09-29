@@ -351,9 +351,6 @@ default.
 
 Useful technical references:
 
-- [`docs/FRAME_MODEL_HOSTS.md`](docs/FRAME_MODEL_HOSTS.md) - integration notes
-  for hosts that drive their own frame or beam loop.
-
 - [`docs/MULTI_TIER.md`](docs/MULTI_TIER.md) — static and interpreted execution
   tiers.
 - [`docs/LLE_FIRST_ANALYSIS.md`](docs/LLE_FIRST_ANALYSIS.md) — analysis policy
