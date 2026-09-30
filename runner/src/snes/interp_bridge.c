@@ -763,9 +763,36 @@ static int _hist_cmp(const void *a, const void *b) {
     return na < nb ? 1 : (na > nb ? -1 : 0);
 }
 static void interp_hist_dump(void) {
+    /* Idempotente: el volcado por presupuesto de frames y el de salida
+     * (atexit) comparten ruta y el primero que llegue gana, para que una
+     * corrida que ya volco a mitad no vuelva a escribir el fichero. */
+    static int s_hist_dumped = 0;
+    if (s_hist_dumped) return;
+    s_hist_dumped = 1;
     unsigned count = 0;
     for (unsigned i = 0; i < PROFILE_HIST_CAP; i++)
         if (s_interp_hist[i].n) count++;
+    /* Histograma COMPLETO (dev, SNESRECOMP_INTERP_PROFILE_FULL=<ruta>): el
+     * dump de arriba solo imprime los 60 primeros, y eso deja la lista de
+     * trabajo AOT a medias -- se sabe que hay ~44k PCs distintos y solo se ven
+     * 60. Aqui van todos, `<pc24> <pasos>`, que es la entrada de
+     * tools/trabajo_aot.py para saber que codigo vive en el interprete y en que
+     * bancos. Coste cero cuando la variable no esta definida. */
+    {
+        const char *fp = getenv("SNESRECOMP_INTERP_PROFILE_FULL");
+        if (fp && *fp) {
+            FILE *f = fopen(fp, "w");
+            if (f) {
+                for (unsigned i = 0; i < PROFILE_HIST_CAP; i++)
+                    if (s_interp_hist[i].n)
+                        fprintf(f, "%06X %llu\n", (unsigned)s_interp_hist[i].pc24,
+                                (unsigned long long)s_interp_hist[i].n);
+                fclose(f);
+                fprintf(stderr, "[interp_profile] histograma completo: %u PCs -> %s\n",
+                        count, fp);
+            }
+        }
+    }
     fprintf(stderr, "\n[interp_profile] %u distinct PCs, top 60 by host-ms (n = steps):\n", count);
     qsort(s_interp_hist, PROFILE_HIST_CAP, sizeof s_interp_hist[0], _hist_cmp);
     double total_ms = 0.0;
@@ -814,6 +841,27 @@ static void interp_hist_dump(void) {
         cp / nframes, cp / (ln + hd) * 100.0,
         hd / nframes, hd / (ln + hd) * 100.0);
 }
+/* Volcado por presupuesto de frames (dev, SNESRECOMP_INTERP_PROFILE_FULL_AT=N):
+ * el dump de salida exige que un humano cierre la ventana, y con eso el
+ * histograma no es reproducible ni automatizable -- una corrida de replay debe
+ * poder terminar sola. Aqui se vuelca UNA vez al alcanzar el frame N de
+ * invitado, sin cortar la ejecucion, asi que sirve con cualquier replay que no
+ * tenga condicion de salida. Coste: una llamada con guarda por paso
+ * interpretado, y solo en builds de perfil. */
+static void interp_hist_maybe_dump_at(void) {
+    static int at = -2;            /* -2 sin leer, -1 no pedido */
+    if (at == -1) return;
+    if (at == -2) {
+        const char *e = getenv("SNESRECOMP_INTERP_PROFILE_FULL_AT");
+        at = (e && *e) ? (int)strtol(e, NULL, 0) : -1;
+        if (at == -1) return;
+    }
+    extern int snes_frame_counter;
+    if (snes_frame_counter < at) return;
+    at = -1;                       /* una sola vez */
+    interp_hist_dump();
+}
+
 static void interp_hist_init(void) {
     static int _done = 0;
     if (!_done) {
@@ -954,6 +1002,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             }
             interp_hist_add(pc_before);
         }
+        interp_hist_maybe_dump_at();
 #endif
 #if SNESRECOMP_REVERSE_DEBUG
         /* The reverse debugger must observe whichever execution tier owns the
