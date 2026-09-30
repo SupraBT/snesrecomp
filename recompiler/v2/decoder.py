@@ -51,6 +51,21 @@ def addr24(bank: int, pc: int) -> int:
     return ((bank & 0xFF) << 16) | (pc & 0xFFFF)
 
 
+def _pc_is_rom(bank: int, pc: int) -> bool:
+    """True when (bank, pc) can hold ROM code.
+
+    Plain LoROM keeps executable code in $8000-$FFFF. Star Ocean's banks
+    $C0-$FF are the S-DD1 MMC window instead: the whole 64 KB of the bank is
+    ROM (page 0), so PCs below $8000 are perfectly valid code there -- the
+    per-frame object dispatcher lives at $C6:2D45. Rejecting those PCs made
+    the decoder return an empty graph (`empty_decode` / `structural_poison`)
+    for the hottest code in the game.
+    """
+    if 0x8000 <= pc <= 0xFFFF:
+        return True
+    return 0xC0 <= (bank & 0xFF) <= 0xFF
+
+
 def _dispatch_target_is_padding(rom: bytes, bank: int, pc16: int,
                                 window: int = 16) -> bool:
     """Return True iff the dispatch-table entry's target bytes look like
@@ -1240,7 +1255,7 @@ def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
     budget = 0
     while budget < 96:
         budget += 1
-        if not (0x8000 <= pc <= 0xFFFF):
+        if not _pc_is_rom(bank, pc):
             return None
         try:
             off = lorom_offset(bank, pc)
@@ -1371,7 +1386,7 @@ def classify_dispatch_helper(rom: bytes, bank: int, addr: int):
     safety = 0
     while safety < 256:
         safety += 1
-        if not (0x8000 <= pc <= 0xFFFF):
+        if not _pc_is_rom(bank, pc):
             return None
         try:
             offset = lorom_offset(bank, pc)
@@ -1780,8 +1795,9 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
             if boundary not in graph.boundary_exits:
                 graph.boundary_exits.append(boundary)
             continue
-        if not (0x8000 <= pc <= 0xFFFF):
+        if not _pc_is_rom(bank, pc):
             # Out-of-bank reference; surface upstream by skipping here.
+            # (Banks $C0-$FF are the S-DD1 MMC window: whole 64 KB is ROM.)
             continue
         if _addr_in_data_regions(data_regions, bank, pc):
             graph.data_region_exec_pcs.add(key.pc & 0xFFFFFF)

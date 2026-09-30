@@ -188,6 +188,15 @@ def _is_invalid_lorom_call_target(addr_24: int) -> bool:
     unit-test contexts that don't load a ROM.
     """
     pc = addr_24 & 0xFFFF
+    bank = (addr_24 >> 16) & 0xFF
+    if 0xC0 <= bank <= 0xFF:
+        # Star Ocean's S-DD1 MMC window: the whole 64 KB of these banks is
+        # ROM, and $C0:xxxx maps linearly to file offset xxxx. PCs below
+        # $8000 are perfectly valid code there (the per-frame object
+        # dispatcher lives at $C6:2D45), so only the ROM-size bound applies.
+        if _ROM_SIZE > 0 and (((bank & 0x3F) << 16) | pc) >= _ROM_SIZE:
+            return True
+        return False
     if pc < 0x8000:
         return True
     if _ROM_SIZE > 0:

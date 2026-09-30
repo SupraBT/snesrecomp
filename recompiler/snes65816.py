@@ -116,6 +116,12 @@ def rom_offset(bank: int, addr: int) -> int:
         assert canonical_bank >= 0x40 or addr >= 0x8000, (
             f"address ${bank:02X}:{addr:04X} is not in a HiROM ROM window")
         return ((canonical_bank & 0x3F) << 16) | addr
+    if 0xC0 <= bank <= 0xFF:
+        # Star Ocean's banks $C0-$FF are the S-DD1 MMC window: the whole
+        # 6 MB ROM mapped linearly, one 64 KB per bank, page 0 by default.
+        # LoROM's "only $8000-$FFFF is ROM inside a bank" rule does not
+        # apply there; $C0:xxxx is the same byte as file xxxx.
+        return ((bank & 0x3F) << 16) | addr
     assert 0x8000 <= addr <= 0xFFFF, (
         f"addr ${addr:04X} not in LoROM range $8000-$FFFF")
     return (bank & 0x7F) * 0x8000 + (addr - 0x8000)
@@ -131,6 +137,9 @@ def is_rom_address(bank: int, addr: int) -> bool:
     if _active_rom_mapping == ROM_MAP_HIROM:
         canonical_bank = bank & 0x7F
         return canonical_bank >= 0x40 or addr >= 0x8000
+    if 0xC0 <= bank <= 0xFF:
+        # S-DD1 MMC window: all 64 KB of the bank is ROM (see rom_offset).
+        return True
     return addr >= 0x8000 and ((bank & 0xFF) < 0x40 or bank >= 0x80)
 
 

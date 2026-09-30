@@ -101,6 +101,9 @@ class FixRecord:
 
 def _rom_offset_lorom(bank: int, addr16: int) -> int:
     """LoROM PC → linear ROM offset. Matches RomPtr in common_rtl.c."""
+    if 0xC0 <= (bank & 0xFF) <= 0xFF:
+        # Star Ocean's S-DD1 MMC window: whole 64 KB per bank, linear.
+        return (((bank & 0xFF) & 0x3F) << 16) | (addr16 & 0xFFFF)
     return ((bank & 0x7F) << 15) | (addr16 & 0x7FFF)
 
 
