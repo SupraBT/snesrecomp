@@ -62,10 +62,21 @@ pub fn load_rom<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     }
 }
 
-/// LoROM (bank, addr) -> physical ROM byte offset. `addr` must be in
-/// $8000-$FFFF (the Python asserts this).
+/// LoROM (bank, addr) -> physical ROM byte offset.
+///
+/// `addr` must be in $8000-$FFFF, EXCEPT in banks $C0-$FF when those are the
+/// S-DD1 MMC window (Star Ocean): there the whole 64 KB is ROM and the window
+/// resolves to page 0 by default, i.e. `((bank & 0x3F) << 16) | addr` -- which
+/// for $C6:2D45 gives 0x62D45, the per-frame object dispatcher. Asserting the
+/// LoROM rule there was what made the toolchain refuse to decode the hottest
+/// code in the game (see `is_rom_address`).
 #[inline]
 pub fn lorom_offset(bank: u32, addr: u32) -> usize {
+    let bank = bank & 0xFF;
+    let addr = addr & 0xFFFF;
+    if (0xC0..=0xFF).contains(&bank) {
+        return (((bank & 0x3F) as usize) << 16) | addr as usize;
+    }
     // Always assert (Python uses a bare `assert`, active in all builds) so an
     // invalid address fails loudly instead of underflowing in release.
     assert!(
@@ -102,7 +113,26 @@ pub fn is_rom_address(mapping: RomMapping, bank: u32, addr: u32) -> bool {
         return false;
     }
     match mapping {
-        RomMapping::LoRom => addr >= 0x8000 && !(0x40..0x80).contains(&bank),
+        RomMapping::LoRom => {
+            // Star Ocean's banks $C0-$FF are the S-DD1 MMC window (see
+            // `sdd1_mmc_linear` in the runner): the WHOLE 64 KB is ROM, one of
+            // four 1 MB pages selected by $4804-$4807. LoROM's "only
+            // $8000-$FFFF is ROM inside a bank" rule does not apply there.
+            //
+            // Applying it anyway made the toolchain BLIND to the lower half of
+            // those banks, and that is where the hottest code in the game
+            // lives: the NMI/IRQ handlers ($C0:0000-$0400) and the per-frame
+            // object dispatcher ($C6:2D45, which walks WRAM and calls the
+            // update routine of every flagged slot -- the code that moves the
+            // player). Decoding them was rejected as `empty_decode`, so those
+            // regions were emitted as LLE dispatch stubs for the whole life of
+            // the project while `rom_offset` already read the correct byte.
+            if (0xC0..=0xFF).contains(&bank) {
+                true
+            } else {
+                addr >= 0x8000 && !(0x40..0x80).contains(&bank)
+            }
+        }
         RomMapping::HiRom => (bank & 0x7F) >= 0x40 || addr >= 0x8000,
     }
 }
