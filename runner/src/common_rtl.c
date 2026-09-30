@@ -1272,6 +1272,23 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu,
     }
   }
 
+  { static int _ipl = -1;
+    if (_ipl < 0) { const char *e = getenv("SNESRECOMP_IPLSTAT");
+                    _ipl = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    if (_ipl) {
+      static int _n = 0;
+      fprintf(stderr, "[iplstat] #%d ipl_phase=%d src=%02X:%04X bloques=%d "
+                      "final_pc=%04X  spcPC=%04X-> romReadable=%d sp=%02X "
+                      "inPorts=%02X%02X%02X%02X ram[0..5]=%02X%02X%02X%02X%02X%02X\n",
+              ++_n, (int)ipl_phase, data_bank, data_lo, block_count, final_pc,
+              g_snes->apu->spc->pc,
+              (int)(g_snes->apu->romReadable ? 1 : 0),
+              g_snes->apu->spc->sp,
+              g_snes->apu->inPorts[0], g_snes->apu->inPorts[1],
+              g_snes->apu->inPorts[2], g_snes->apu->inPorts[3],
+              g_snes->apu->ram[0], g_snes->apu->ram[1], g_snes->apu->ram[2],
+              g_snes->apu->ram[3], g_snes->apu->ram[4], g_snes->apu->ram[5]);
+    } }
   /* First-upload vs subsequent-upload semantics differ. The very first
    * upload from CPU after reset goes through the SNES SPC IPL bootROM,
    * which ends with `JMP [$0000+X]` — i.e. the IPL jumps to the entry
@@ -1407,13 +1424,23 @@ static void rtl_sync_apu_frame_boundary(void) {
       extern uint64_t dsp_ring_energy(void *);
       extern uint64_t g_apu_timer0_total_ticks;
       fprintf(stderr, "[dspstat] f=%d portClock=%llu anillo=%u energia=%llu "
-                      "spcPC=%04X tim0=%llu\n",
+                      "spcPC=%04X tim0=%llu inPorts=%02X%02X%02X%02X "
+                      "outPorts=%02X%02X%02X%02X rom=%d sp=%02X "
+                      "ram00=%02X%02X%02X%02X\n",
               (int)snes_frame_counter,
               (unsigned long long)g_snes->apu->portClock,
               dsp_available(g_snes->apu->dsp),
               (unsigned long long)dsp_ring_energy(g_snes->apu->dsp),
               (unsigned)g_snes->apu->spc->pc,
-              (unsigned long long)g_apu_timer0_total_ticks);
+              (unsigned long long)g_apu_timer0_total_ticks,
+              g_snes->apu->inPorts[0], g_snes->apu->inPorts[1],
+              g_snes->apu->inPorts[2], g_snes->apu->inPorts[3],
+              g_snes->apu->outPorts[0], g_snes->apu->outPorts[1],
+              g_snes->apu->outPorts[2], g_snes->apu->outPorts[3],
+              (int)(g_snes->apu->romReadable ? 1 : 0),
+              g_snes->apu->spc->sp,
+              g_snes->apu->ram[0], g_snes->apu->ram[1],
+              g_snes->apu->ram[2], g_snes->apu->ram[3]);
       /* Volcado del estado del DSP en un instante de reloj de INVITADO concreto
        * (portClock), para comparar dos configuraciones en el mismo punto de la
        * maquina y no en el mismo fotograma de host (que con la deadline activa
