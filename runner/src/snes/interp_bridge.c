@@ -187,13 +187,51 @@ static int bridge_continuous_read(uint32_t adr) {
     return 0;
 }
 
+/* ── Diagnostico: coste real de los spin del puerto APU ──────────────────
+ * El frame lento del juego (f705/f708, ~90 ms de host con 1,3 ms de dibujo)
+ * se pasa en el handshake $C0:859D: `LDA $002140 / CMP $002140 / BNE`, o
+ * sea decenas de miles de lecturas al puerto del SPC700. Aqui se mide, por
+ * fotograma, cuantas son y cuanto TIEMPO DE HOST se llevan, para saber si el
+ * cuello es el bucle mismo o el coste por lectura. Solo activo con
+ * SNESRECOMP_HOTSTAT=1. */
+uint64_t g_hm_ops = 0;        /* opcodes interpretados */
+uint64_t g_hm_apu_reads = 0;  /* accesos a $2140-$217F */
+uint64_t g_hm_apu_ns = 0;     /* ns de host dentro de esos accesos */
+int g_hm_stat_on = -1;
+uint64_t g_hm_iter_ns = 0;   /* ns entre PC consecutivos: el bucle entero */
+uint64_t g_hm_op_ns = 0;     /* ns dentro de interp816_runOpcode */
+uint64_t s_hm_prev_t = 0;
+
+#if defined(_WIN32)
+#include <windows.h>
+static uint64_t hm_ns(void) {
+    static LARGE_INTEGER freq; LARGE_INTEGER now;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    return (uint64_t)((double)now.QuadPart * 1e9 / (double)freq.QuadPart);
+}
+#else
+#include <time.h>
+static uint64_t hm_ns(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+#endif
+
 static uint8_t bridge_bus_read(void *mem, uint32_t adr) {
     CpuState *cpu = (CpuState *)mem;
     bridge_timing_bus(adr);
     int continuous=bridge_continuous_read(adr);
     if (continuous) s_interp_continuous_read_epoch++;
-    if (bridge_is_apu_port(adr)) bridge_apu_flush(cpu);
-    uint8_t value=cpu_read8(cpu,(uint8)((adr>>16)&0xff),(uint16)adr);
+    uint8_t value;
+    if (bridge_is_apu_port(adr)) {
+        const uint64_t _t0 = hm_ns();
+        bridge_apu_flush(cpu);
+        value=cpu_read8(cpu,(uint8)((adr>>16)&0xff),(uint16)adr);
+        g_hm_apu_reads++;
+        g_hm_apu_ns += hm_ns() - _t0;
+    } else
+    value=cpu_read8(cpu,(uint8)((adr>>16)&0xff),(uint16)adr);
     if (continuous) {
         BridgeDynamicValue *d=&s_bridge_dynamic_values[(adr^(adr>>8)^(adr>>16))&63];
         if (!d->valid || d->address!=adr || d->value!=value) {
@@ -260,8 +298,10 @@ static bool bridge_bus_read_word(void *mem, uint32_t adrl, uint32_t adrh,
     if (bridge_continuous_read(adrl) || bridge_continuous_read(adrh))
         s_interp_continuous_read_epoch++;
     CpuState *cpu = (CpuState *)mem;
-    if (bridge_is_apu_port(adrl)) bridge_apu_flush(cpu);
+    uint64_t _t1 = 0;
+    if (bridge_is_apu_port(adrl)) { _t1 = hm_ns(); bridge_apu_flush(cpu); }
     *out = cpu_read16(cpu, (uint8)((adrl >> 16) & 0xFF), (uint16)(adrl & 0xFFFF));
+    if (_t1) { g_hm_apu_reads++; g_hm_apu_ns += hm_ns() - _t1; }
     if (getenv("SNESRECOMP_APU_PORT_DIAG") && (uint16_t)adrl == 0x2140) {
         static uint16_t last=0xffff; static unsigned reports;
         if (*out!=last && reports++<256) {
@@ -947,6 +987,8 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
         uint64_t continuous_read_epoch;
         long step;
         unsigned repeats;
+        uint32_t gen;   /* generacion de epocas con la que se escribio */
+        uint64_t key;   /* pre-filtro barato de la igualdad completa */
     } QuiescentState;
     QuiescentState qring[64];
     memset(qring, 0, sizeof qring);
@@ -955,6 +997,38 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     long steps = 0;
     uint64_t progress_write_epoch=g_interp_bridge_write_epoch;
     uint64_t progress_dynamic_epoch=s_interp_dynamic_progress_epoch;
+    /* Pre-filtro del detector de spin (medido: el escaneo de las 64 ranuras
+     * cuesta ~600 ns por opcode y es el 65-72% del overhead del bucle del
+     * interprete; en el handshake $C0:859D son 125.922 opcodes por fotograma
+     * y de ahi salen los picos de 90-250 ms). Dos filtros, ambos EXACTOS:
+     *
+     *  (a) Generacion de epocas. La igualdad completa exige write_epoch Y
+     *      continuous_read_epoch iguales, y ambos son monotonos. Una ranura
+     *      escrita antes del ultimo cambio de esas epocas tiene un valor
+     *      distinto, luego NO puede coincidir. Como ambos contadores suben en
+     *      practicamente cada instruccion (todo acceso a memoria lo es, y en
+     *      este juego el banco WRAM tambien cuenta como lectura continua), el
+     *      escaneo es descartable casi siempre: `qlive` cuenta las ranuras de
+     *      la generacion viva y si es cero no hay nada que buscar.
+     *  (b) Clave de 64 bits sobre campos que la igualdad ya exige. Si la clave
+     *      difiere, la comparacion completa tambien fallaria, asi que el
+     *      pre-filtro nunca descarta una coincidencia real.
+     *
+     * El orden ascendente de indices y el primer-glyoganador se conservan,
+     * luego el detector decide EXACTAMENTE lo mismo que antes. */
+    uint32_t qgen = 1;
+    long q_floor = 0;   /* step del ultimo cambio de write/read epoch */
+    /* SNESRECOMP_QSCAN_FILTER=0 devuelve el escaneo a su forma original. No es
+     * solo diagnostico: es la puerta A/B del parche, porque comparar el mismo
+     * binario con el filtro puesto y quitado aísla el cambio de cualquier otra
+     * variable (build, config, audio, carga del host). */
+    static int s_qf = -1;
+    if (s_qf < 0) {
+        const char *_e = getenv("SNESRECOMP_QSCAN_FILTER");
+        s_qf = (_e && _e[0] && _e[0] != '0') ? 1 : 0;
+    }
+    uint64_t q_last_we = g_interp_bridge_write_epoch;
+    uint64_t q_last_re = s_interp_continuous_read_epoch;
     /* The pre-opcode poll-shape recognition below reads the instruction bytes
      * (pc_before, pc_before+3) on every interpreted opcode.  All three checks
      * that consume them require yield_pc && !auto_quiescent, which is never
@@ -976,6 +1050,14 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     }
     for (; steps < step_cap; steps++) {
         const uint32_t pc_before = ((uint32_t)in.k << 16) | in.pc;
+        /* Reloj del bucle: el periodo entre dos instrucciones consecutivas
+         * mide el coste del cuerpo COMPLETO (opcode + bus + reloj + quiescente),
+         * que es lo que hay que repartir. */
+        if (g_hm_stat_on) {
+            const uint64_t _it = hm_ns();
+            if (s_hm_prev_t) g_hm_iter_ns += _it - s_hm_prev_t;
+            s_hm_prev_t = _it;
+        }
 #ifdef SNESRECOMP_INTERP_PROFILE
         g_interp_total_steps++;
         interp_hist_init();
@@ -1333,7 +1415,19 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 }
             }
         }
-        if (auto_quiescent) {
+        static int s_nq = -1;
+        if (s_nq < 0) { const char *_e = getenv("SNESRECOMP_NO_QSCAN");
+                      s_nq = (_e && _e[0] && _e[0] != '0') ? 0 : 1; }
+        if (auto_quiescent && s_nq) {
+            /* (a) si las epocas cambiaron, ninguna ranura anterior coincide */
+            const uint64_t qwe = g_interp_bridge_write_epoch;
+            const uint64_t qre = s_interp_continuous_read_epoch;
+            if (qwe != q_last_we || qre != q_last_re) {
+                q_last_we = qwe;
+                q_last_re = qre;
+                q_floor = steps;   /* solo las ranuras de este step en
+                                     * adelante pueden coincidir */
+            }
             QuiescentState now;
             memset(&now, 0, sizeof now);
             now.pc=pc_before; now.a=in.a; now.x=in.x; now.y=in.y;
@@ -1342,9 +1436,25 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             now.d=in.d; now.mf=in.mf; now.xf=in.xf; now.e=in.e;
             now.write_epoch=g_interp_bridge_write_epoch; now.step=steps;
             now.continuous_read_epoch=s_interp_continuous_read_epoch;
-            for (unsigned qi=0; qi<64; qi++) {
-                QuiescentState *old=&qring[qi];
-                if (old->step && steps-old->step<=256 &&
+            /* (b) clave sobre campos que la igualdad ya exige: si difiere, la
+             * comparacion completa fallaria igual, asi que el filtro es
+             * conservador y el detector decide lo mismo. */
+            uint64_t _qk = (uint64_t)pc_before * 0x9E3779B97F4A7C15ull;
+            _qk = _qk * 31ull + (uint64_t)(now.a | ((uint64_t)now.sp << 16));
+            _qk ^= qwe * 0xD6E8FEB86659FD93ull;
+            _qk ^= (qre * 0xA24BAED4963EE407ull) << 1;
+            unsigned qd = 0;
+            if (s_qf) {
+                qd = (steps > q_floor) ? (unsigned)(steps - q_floor) : 0u;
+                if (qd > 63u) qd = 63u;
+            } else {
+                qd = 63u;            /* forma original: las 64 ranuras */
+            }
+            unsigned qidx = (unsigned)(steps - qd) & 63u;
+            for (unsigned qj = 0; qj <= qd; qj++, qidx = (qidx + 1u) & 63u) {
+                QuiescentState *old=&qring[qidx];
+                if (old->step && (!s_qf || old->key==_qk) &&
+                    steps-old->step<=256 &&
                     old->pc==now.pc && old->a==now.a && old->x==now.x &&
                     old->y==now.y && old->sp==now.sp && old->dp==now.dp &&
                     old->db==now.db && old->k==now.k && old->c==now.c &&
@@ -1423,7 +1533,12 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                     break;
                 }
             }
-            qring[steps & 63]=now;
+            {
+                QuiescentState *slot=&qring[steps & 63];
+                slot->gen=qgen;
+                now.key=_qk;
+                *slot=now;
+            }
         }
         if (s_pre_opcode_hook_count > 0) {
             const uint32_t key = pc_before & 0x7FFFFFu;
@@ -1782,7 +1897,14 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             sync_interp_to_cpu(&in, cpu);
         }
         cpu->coprocessor_master_cycles = cpu->master_cycles;
+        if (g_hm_stat_on < 0) {
+            const char *_e = getenv("SNESRECOMP_HOTSTAT");
+            g_hm_stat_on = (_e && _e[0] && _e[0] != '0') ? 1 : 0;
+        }
+        uint64_t _op_t = 0;
+        if (g_hm_stat_on) { g_hm_ops++; _op_t = hm_ns(); }
         int _cyc = interp816_runOpcode(&in);   /* executes the opcode; pushes/pops frames */
+        if (g_hm_stat_on) g_hm_op_ns += hm_ns() - _op_t;
         s_interp_bus_timing_active=0;
         if (dtrace && in.dp != dp_before) {
             extern int snes_frame_counter;
