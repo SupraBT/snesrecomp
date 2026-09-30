@@ -195,21 +195,32 @@ static int bridge_continuous_read(uint32_t adr) {
  * cuello es el bucle mismo o el coste por lectura. Solo activo con
  * SNESRECOMP_HOTSTAT=1. */
 uint64_t g_hm_ops = 0;        /* opcodes interpretados */
+/* Motivo de cada cesion del LLE (diagnostico SNESRECOMP_HOTSTAT=1).  Con la
+ * deadline activa el hilo puede salir por cuatro sitios distintos y cada uno
+ * deja al invitado en un punto distinto del fotograma; saber cual es el que
+ * domina dice si el problema es de RELOJ (deadline) o de ENTREGA (irq/wai). */
+uint64_t g_yield_irq = 0;
+uint64_t g_yield_deadline = 0;
+uint64_t g_yield_quiesc = 0;
+uint64_t g_yield_wai = 0;
 uint64_t g_hm_apu_reads = 0;  /* accesos a $2140-$217F */
 uint64_t g_hm_apu_ns = 0;     /* ns de host dentro de esos accesos */
 int g_hm_stat_on = -1;
 uint64_t g_hm_iter_ns = 0;   /* ns entre PC consecutivos: el bucle entero */
 uint64_t g_hm_op_ns = 0;     /* ns dentro de interp816_runOpcode */
 uint64_t s_hm_prev_t = 0;
+uint64_t g_hm_bus_ns = 0;   /* ns dentro de TODOS los accesos a memoria */
+uint64_t g_hm_bus_n = 0;    /* accesos a memoria */
 
 #if defined(_WIN32)
 #include <windows.h>
-static uint64_t hm_ns(void) {
-    static LARGE_INTEGER freq; LARGE_INTEGER now;
-    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&now);
-    return (uint64_t)((double)now.QuadPart * 1e9 / (double)freq.QuadPart);
-}
+#include <intrin.h>
+/* rdtsc, NO QueryPerformanceCounter. Medido en esta maquina: QPC cuesta
+ * ~200 ns por llamada, y como se llamaba dos veces por instruccion
+ * interpretada, la instrumentacion se comia ~400 ns de los "500 ns por
+ * opcode" que parecian medir. rdtsc cuesta ~1 ns, asi que el numero
+ * medido es el numero real. */
+static uint64_t hm_ns(void) { return (uint64_t)__rdtsc(); }
 #else
 #include <time.h>
 static uint64_t hm_ns(void) {
@@ -220,6 +231,7 @@ static uint64_t hm_ns(void) {
 
 static uint8_t bridge_bus_read(void *mem, uint32_t adr) {
     CpuState *cpu = (CpuState *)mem;
+    const uint64_t _bt0 = hm_ns();
     bridge_timing_bus(adr);
     int continuous=bridge_continuous_read(adr);
     if (continuous) s_interp_continuous_read_epoch++;
@@ -239,6 +251,8 @@ static uint8_t bridge_bus_read(void *mem, uint32_t adr) {
             s_interp_dynamic_progress_epoch++;
         }
     }
+    g_hm_bus_ns += hm_ns() - _bt0;
+    g_hm_bus_n++;
     return value;
 }
 static void bridge_bus_write(void *mem, uint32_t adr, uint8_t val) {
@@ -1110,9 +1124,9 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
               * interrupts enabled ($7F51 bit 0 clear). Same shape as the GSU
               * line above; omitting it would starve the handler. */
              (g_snes->cart && g_snes->cart->cx4 &&
-              cx4_irq_pending(g_snes->cart->cx4)) ||
-             (g_snes->cart && g_snes->cart->sa1 &&
-              sa1_cpu_irq_pending(g_snes->cart->sa1)))) {
+              cx4_irq_pending(g_snes->cart->cx4)) ||(g_snes->cart && g_snes->cart->sa1 &&
+               sa1_cpu_irq_pending(g_snes->cart->sa1)))) {
+            g_yield_irq++;
             s_lle_resume_pc24=pc_before;
             sync_interp_to_cpu(&in,cpu);
             bridge_apu_flush(cpu);
@@ -1120,6 +1134,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
         }
         if (auto_quiescent && s_lle_master_deadline &&
             cpu->master_cycles >= s_lle_master_deadline) {
+            g_yield_deadline++;
             s_lle_resume_pc24=pc_before;
             sync_interp_to_cpu(&in,cpu);
             bridge_apu_flush(cpu);
@@ -1519,8 +1534,9 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                                                        cpu->master_cycles);
                             cpu->coprocessor_master_cycles = cpu->master_cycles;
                         }
-                        s_lle_resume_pc24=pc_before;
-                        s_lle_quiescent_yield = 1;
+                g_yield_quiesc++;
+                s_lle_resume_pc24=pc_before;
+                s_lle_quiescent_yield = 1;
                         /* Flush accumulated SPC time BEFORE yielding so the
                          * SPC700 processes any pending port writes (Star Ocean
                          * boot handshake: CPU writes to $2140-$2143 and polls
@@ -2007,6 +2023,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             if (auto_quiescent || yield_pc) {
                 s_lle_resume_pc24 = ((uint32_t)in.k << 16) | in.pc;
                 s_lle_wai_yield = 1;
+                g_yield_wai++;
                 sync_interp_to_cpu(&in, cpu);
                 bridge_apu_flush(cpu);
                 return 1;

@@ -64,7 +64,16 @@ void apu_clearPortQueue(Apu* apu) {
   apu->portTimeValid = false;
 }
 
+/* Diagnostico: escrituras de puerto que EL INVITADO ha hecho llegar al SPC y
+ * profundidad de la cola de puertos pendientes.  Si la cola no baja de cero el
+ * invitado entrega su audio pero el DSP nunca lo ve (silencio con musica
+ * sonando por dentro). */
+uint64_t g_apu_port_writes = 0;
+uint64_t g_apu_port_queue_max = 0;
+uint64_t g_apu_port_dropped = 0;
+
 void apu_writePortNow(Apu* apu, uint8_t port, uint8_t val) {
+  g_apu_port_writes++;
   port &= 3;
   apu->inPorts[port] = val;
   audio_trace_on_cpu_port_apply(port, val);
@@ -80,8 +89,12 @@ uint32_t apu_portQueueDepth(const Apu* apu) {
 
 bool apu_schedulePortWrite(Apu* apu, uint8_t port, uint8_t val,
                            uint64_t guest_cycle) {
-  if (apu_portQueueDepth(apu) >= APU_PORT_QUEUE_LEN)
+  if (apu_portQueueDepth(apu) >= APU_PORT_QUEUE_LEN) {
+    g_apu_port_dropped++;
     return false;
+  }
+  if (apu_portQueueDepth(apu) > g_apu_port_queue_max)
+    g_apu_port_queue_max = apu_portQueueDepth(apu);
 
   /* Establish a correspondence between guest time and wherever the
    * callback-driven SPC is now. If the callback later runs ahead, rebase at

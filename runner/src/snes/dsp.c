@@ -641,6 +641,23 @@ uint32_t dsp_available(const Dsp* dsp) {
   return dsp->sampleWrite - dsp->sampleRead;
 }
 
+/* Diagnostico: energia (suma de |L|+|R|) de las natives que hay en el anillo
+ * SIN retirar.  Distingue "el DSP no produce" (anillo vacio) de "el DSP
+ * produce silencio" (anillo lleno de ceros), que son fallos muy distintos y
+ * hasta ahora indistinguibles desde fuera porque ambos suenan a mudo. */
+uint64_t dsp_ring_energy(const Dsp* dsp) {
+  uint32_t available = dsp->sampleWrite - dsp->sampleRead;
+  if (available > DSP_SAMPLE_RING) available = DSP_SAMPLE_RING;
+  uint64_t e = 0;
+  for (uint32_t i = 0; i < available; i++) {
+    uint32_t idx = (dsp->sampleRead + i) & (DSP_SAMPLE_RING - 1);
+    int32_t l = dsp->sampleBuffer[idx * 2];
+    int32_t r = dsp->sampleBuffer[idx * 2 + 1];
+    e += (uint64_t)(l < 0 ? -l : l) + (uint64_t)(r < 0 ? -r : r);
+  }
+  return e;
+}
+
 void dsp_peek(const Dsp* dsp, uint32_t offset, int16_t* l, int16_t* r) {
   uint32_t idx = (dsp->sampleRead + offset) & (DSP_SAMPLE_RING - 1);
   *l = dsp->sampleBuffer[idx * 2];

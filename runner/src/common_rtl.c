@@ -154,12 +154,32 @@ static int16 g_audio_last_output_l;
 static int16 g_audio_last_output_r;
 static void rtl_sync_apu_frame_boundary(void);
 
+/* Reloj real del invitado para el APU (SNESRECOMP_APU_REAL_CLOCK=1).
+ *
+ * El ruler de arriba es una SINTESIS: da por hecho que un fotograma de host es
+ * un fotograma de invitado.  Eso solo es cierto con la deadline de fotograma
+ * activa; sin ella el invitado corre por delante y el APU recibe una linea de
+ * tiempo equivocada.  Con la deadline activa el ruler y el reloj coinciden, y
+ * aun asi el audio se pierde: la prueba esta en el propioGuest, no en el
+ * requerimiento de usar el reloj real.  Por eso esto va detrAS una puerta y no
+ * por defecto: hay que pasar antes la puerta A/B de 6000 fotogramas. */
+static int rtl_apu_use_real_clock(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char *e = getenv("SNESRECOMP_APU_REAL_CLOCK");
+    v = (e && e[0] && e[0] != '0') ? 1 : 0;
+  }
+  return v;
+}
+
 static uint64_t rtl_apu_guest_cycle(void) {
   uint64_t within = g_cpu.master_cycles - g_apu_frame_start_master;
   if (within >= RTL_MASTER_CYCLES_PER_FRAME)
     within = RTL_MASTER_CYCLES_PER_FRAME - 1;
   uint64_t total_master = (uint64_t)snes_frame_counter *
                           RTL_MASTER_CYCLES_PER_FRAME + within;
+  if (rtl_apu_use_real_clock())
+    total_master = g_cpu.master_cycles;
   return total_master * RTL_APU_RATIO_NUM / RTL_APU_RATIO_DEN;
 }
 // $420D bit 0 (FastROM / MEMSEL): 1 => $80-$FF:$8000-$FFFF code runs fast (6
@@ -1371,8 +1391,62 @@ static void rtl_sync_apu_frame_boundary(void) {
   uint64_t boundary = (uint64_t)snes_frame_counter *
                       RTL_MASTER_CYCLES_PER_FRAME *
                       RTL_APU_RATIO_NUM / RTL_APU_RATIO_DEN;
+  if (rtl_apu_use_real_clock())
+    boundary = g_cpu.master_cycles * RTL_APU_RATIO_NUM / RTL_APU_RATIO_DEN;
   bool synced = apu_runToGuestCycle(g_snes->apu, boundary,
                                     1u << 20);
+  { static int _ds = -1;
+    static uint64_t _dump_at = 0;
+    static int _dumped = 0;
+    if (_ds < 0) { const char *e = getenv("SNESRECOMP_DSPSTAT");
+                   _ds = (e && e[0] && e[0] != '0') ? 1 : 0;
+                   const char *a = getenv("SNESRECOMP_DSP_DUMP_AT");
+                   _dump_at = a ? strtoull(a, NULL, 0) : 0; }
+    if (_ds) {
+      extern uint32_t dsp_available(void *);
+      extern uint64_t dsp_ring_energy(void *);
+      fprintf(stderr, "[dspstat] f=%d portClock=%llu anillo=%u energia=%llu\n",
+              (int)snes_frame_counter,
+              (unsigned long long)g_snes->apu->portClock,
+              dsp_available(g_snes->apu->dsp),
+              (unsigned long long)dsp_ring_energy(g_snes->apu->dsp));
+      /* Volcado del estado del DSP en un instante de reloj de INVITADO concreto
+       * (portClock), para comparar dos configuraciones en el mismo punto de la
+       * maquina y no en el mismo fotograma de host (que con la deadline activa
+       * son guest frames distintos). */
+      if (_dump_at && !_dumped &&
+          g_snes->apu->portClock >= _dump_at) {
+        _dumped = 1;
+        Dsp *d = g_snes->apu->dsp;
+        uint64_t h = 1469598103934665603ull;
+        for (unsigned i = 0; i < sizeof(g_snes->apu->ram); i++) {
+          h ^= g_snes->apu->ram[i]; h *= 1099511628211ull; }
+        uint64_t h2 = 1469598103934665603ull;
+        for (unsigned i = 0; i < sizeof(d->ram); i++) {
+          h2 ^= d->ram[i]; h2 *= 1099511628211ull; }
+        fprintf(stderr, "[dspdump] f=%d portClock=%llu energia=%llu "
+                        "echoVol=%u/%u master=%u/%u dirPage=%04X echoAdr=%04X echoDly=%u "
+                        "spcRAM=%016llu dspRAM=%016llu fir=",
+                (int)snes_frame_counter,
+                (unsigned long long)g_snes->apu->portClock,
+                (unsigned long long)dsp_ring_energy(d),
+                (unsigned)(int8_t)d->echoVolumeL,
+                (unsigned)(int8_t)d->echoVolumeR,
+                (unsigned)(int8_t)d->masterVolumeL,
+                (unsigned)(int8_t)d->masterVolumeR, (unsigned)d->dirPage,
+                (unsigned)d->echoBufferAdr, (unsigned)d->echoDelay,
+                (unsigned long long)h, (unsigned long long)h2);
+        for (int i = 0; i < 4; i++)
+          fprintf(stderr, "%02X/%02X", d->firValues[i * 2],
+                  d->firValues[i * 2 + 1]);
+        fprintf(stderr, "  ");
+        for (int i = 0; i < 4; i++)
+          fprintf(stderr, "c%d=%02X/%02X/%d ", i,
+                  d->channel[i].volumeL, d->channel[i].volumeR,
+                  (int)d->channel[i].keyOn);
+        fprintf(stderr, "\n");
+      }
+    } }
   audio_trace_on_guest_sync(1, g_snes->apu->portClock - before);
   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
   if (!synced)

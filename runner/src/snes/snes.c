@@ -189,12 +189,20 @@ void snes_reset(Snes* snes, bool hard) {
 static uint64_t s_catchup_calls = 0;
 static uint64_t s_catchup_cycles_total = 0;
 uint64_t g_apu_timer0_total_ticks = 0;
+/* Diagnostico (SNESRECOMP_HOTSTAT=1): ciclos SPC que el invitado OFRECE y
+ * ciclos SPC que el SPC700 llega a ejecutar.  La diferencia es tiempo de
+ * invitado que se pierde en el tope de 10000 por llamada, y por tanto audio
+ * que nunca suena. */
+uint64_t g_apu_cycles_offered = 0;
+uint64_t g_apu_cycles_run = 0;
 #ifdef SNESRECOMP_INTERP_PROFILE
 uint64_t apucyc_prof_calls = 0;
 double apucyc_prof_ms = 0.0;
 #endif
 
 void snes_catchupApu(Snes* snes) {
+  g_apu_cycles_offered +=
+      (snes->apuCatchupCycles > 0.0) ? (uint64_t) snes->apuCatchupCycles : 0u;
   /* Upper cap is a guard against accumulator runaway after a long
    * stall; SPC runs at ~1 MHz so 10000 cycles is about 10 ms of real
    * SPC time per catchup, plenty to absorb any spike. */
@@ -216,6 +224,7 @@ void snes_catchupApu(Snes* snes) {
    * time even when the CPU is busy elsewhere. */
   int catchupCycles = (int) snes->apuCatchupCycles;
   if (catchupCycles < 0) catchupCycles = 0;
+  g_apu_cycles_run += (uint64_t) catchupCycles;
 
   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_CPU);
 #ifdef SNESRECOMP_INTERP_PROFILE
