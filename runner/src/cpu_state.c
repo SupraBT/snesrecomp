@@ -315,8 +315,13 @@ static int s_apu_writes_logged = 0;
  * Coste cero cuando la variable no está definida. */
 static FILE *s_apu_rw_fp;
 static int s_apu_rw_state = -1;
+static int s_apu_rw_log_writes = 1;   /* SNESRECOMP_APU_PORT_RW_W=0 los apaga */
+static int s_apu_rw_log_reads = 1;    /* SNESRECOMP_APU_PORT_RW_R=0 los apaga */
+static long s_apu_rw_from = -1;       /* SNESRECOMP_APU_PORT_RW_FROM=<frame>       */
+static int s_apu_rw_last_frame = -1;
 
 extern CpuState g_cpu;
+extern int snes_frame_counter;
 
 static void apu_port_rw_log(uint16 addr, int is_read, uint16 val) {
     if (s_apu_rw_state < 0) {
@@ -325,16 +330,37 @@ static void apu_port_rw_log(uint16 addr, int is_read, uint16 val) {
         if (s_apu_rw_state == 1) {
             const char *path = (e && e[0] && e[0] != '1') ? e : "apu_port_rw.log";
             s_apu_rw_fp = fopen(path, "w");
-            if (s_apu_rw_fp) setvbuf(s_apu_rw_fp, NULL, _IONBF, 0);
+            if (s_apu_rw_fp) {
+                /* BUFFERED, not unbuffered. Measured on Star Ocean: the boot
+                 * IPL polls $2140 thousands of times per frame, so a write()
+                 * per line caps the trace at ~3.3k lines/s and the guest
+                 * crawls -- 3 frames in 25 s, which looks exactly like a hang.
+                 * With a 1 MB block buffer plus a flush per guest frame the
+                 * trace keeps up and the tail is never lost by more than one
+                 * frame. */
+                static char s_apu_rw_buf[1u << 20];
+                setvbuf(s_apu_rw_fp, s_apu_rw_buf, _IOFBF, sizeof s_apu_rw_buf);
+            }
+            { const char *w = getenv("SNESRECOMP_APU_PORT_RW_W");
+              if (w && w[0]) s_apu_rw_log_writes = (w[0] != '0'); }
+            { const char *r = getenv("SNESRECOMP_APU_PORT_RW_R");
+              if (r && r[0]) s_apu_rw_log_reads = (r[0] != '0'); }
+            { const char *f = getenv("SNESRECOMP_APU_PORT_RW_FROM");
+              if (f && f[0]) s_apu_rw_from = atol(f); }
         }
     }
     if (s_apu_rw_state != 1 || !s_apu_rw_fp) return;
-    extern int snes_frame_counter;
+    if (is_read ? !s_apu_rw_log_reads : !s_apu_rw_log_writes) return;
+    if (s_apu_rw_from >= 0 && snes_frame_counter < s_apu_rw_from) return;
     extern const char *g_last_recomp_func;
     fprintf(s_apu_rw_fp, "f%-6d %c $%04X=%02X master=%llu %s\n",
             snes_frame_counter, is_read ? 'R' : 'W', addr, (unsigned)(val & 0xFF),
             (unsigned long long)g_cpu.master_cycles,
             g_last_recomp_func ? g_last_recomp_func : "(none)");
+    if (snes_frame_counter != s_apu_rw_last_frame) {
+        s_apu_rw_last_frame = snes_frame_counter;
+        fflush(s_apu_rw_fp);   /* el volcado no pierde mas de un frame */
+    }
 }
 
 /* Conteo de LECTURAS por frame de rangos de registros de hardware, dev y
