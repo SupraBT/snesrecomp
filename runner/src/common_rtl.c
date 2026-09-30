@@ -1405,11 +1405,15 @@ static void rtl_sync_apu_frame_boundary(void) {
     if (_ds) {
       extern uint32_t dsp_available(void *);
       extern uint64_t dsp_ring_energy(void *);
-      fprintf(stderr, "[dspstat] f=%d portClock=%llu anillo=%u energia=%llu\n",
+      extern uint64_t g_apu_timer0_total_ticks;
+      fprintf(stderr, "[dspstat] f=%d portClock=%llu anillo=%u energia=%llu "
+                      "spcPC=%04X tim0=%llu\n",
               (int)snes_frame_counter,
               (unsigned long long)g_snes->apu->portClock,
               dsp_available(g_snes->apu->dsp),
-              (unsigned long long)dsp_ring_energy(g_snes->apu->dsp));
+              (unsigned long long)dsp_ring_energy(g_snes->apu->dsp),
+              (unsigned)g_snes->apu->spc->pc,
+              (unsigned long long)g_apu_timer0_total_ticks);
       /* Volcado del estado del DSP en un instante de reloj de INVITADO concreto
        * (portClock), para comparar dos configuraciones en el mismo punto de la
        * maquina y no en el mismo fotograma de host (que con la deadline activa
