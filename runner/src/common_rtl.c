@@ -1423,11 +1423,37 @@ static void rtl_sync_apu_frame_boundary(void) {
       extern uint32_t dsp_available(void *);
       extern uint64_t dsp_ring_energy(void *);
       extern uint64_t g_apu_timer0_total_ticks;
-      fprintf(stderr, "[dspstat] f=%d portClock=%llu anillo=%u energia=%llu "
+      extern uint64_t g_spc_port_w, g_spc_dsp_adr, g_spc_dsp_dat;
+      static uint64_t spcw_total, spcadr_total, spcdat_total;
+      static uint64_t srd[4] = {0, 0, 0, 0};
+      extern uint64_t g_apu_port_writes;
+      extern uint64_t g_apu_port_dropped, g_apu_port_queue_max;
+      extern uint64_t g_inp_overwritten;
+      extern uint64_t g_spc_port_reads[4];
+      extern uint64_t g_apu_stream_hash;
+      extern uint32_t apu_portQueueDepth(const void *);
+      /* gf = frame de INVITADO (master_cycles/357368), no el de host: sin
+       * deadline el invitado corre por delante y las cuentas por frame de host
+       * no son comparables con la traza de hardware. */
+      fprintf(stderr, "[dspstat] f=%d gf=%llu pW2140=%llu pDrop=%llu pLost=%llu pRd=%llu/%llu/%llu/%llu pHash=%016llx "
+                      "pProf=%llu pQ=%u "
+                      "portClock=%llu anillo=%u energia=%llu "
                       "spcPC=%04X tim0=%llu inPorts=%02X%02X%02X%02X "
                       "outPorts=%02X%02X%02X%02X rom=%d sp=%02X "
+                      "spcW=%llu spcAdr=%llu spcDat=%llu "
                       "ram00=%02X%02X%02X%02X\n",
               (int)snes_frame_counter,
+              (unsigned long long)(g_cpu.master_cycles / 357368ull),
+              (unsigned long long)g_apu_port_writes,
+              (unsigned long long)g_apu_port_dropped,
+              (unsigned long long)g_inp_overwritten,
+              (unsigned long long)(g_spc_port_reads[0] - srd[0]),
+              (unsigned long long)(g_spc_port_reads[1] - srd[1]),
+              (unsigned long long)(g_spc_port_reads[2] - srd[2]),
+              (unsigned long long)(g_spc_port_reads[3] - srd[3]),
+              (unsigned long long)g_apu_stream_hash,
+              (unsigned long long)g_apu_port_queue_max,
+              apu_portQueueDepth(g_snes->apu),
               (unsigned long long)g_snes->apu->portClock,
               dsp_available(g_snes->apu->dsp),
               (unsigned long long)dsp_ring_energy(g_snes->apu->dsp),
@@ -1439,8 +1465,50 @@ static void rtl_sync_apu_frame_boundary(void) {
               g_snes->apu->outPorts[2], g_snes->apu->outPorts[3],
               (int)(g_snes->apu->romReadable ? 1 : 0),
               g_snes->apu->spc->sp,
+              (unsigned long long)spcw_total, (unsigned long long)spcadr_total,
+              (unsigned long long)spcdat_total,
               g_snes->apu->ram[0], g_snes->apu->ram[1],
               g_snes->apu->ram[2], g_snes->apu->ram[3]);
+      spcw_total = g_spc_port_w; spcadr_total = g_spc_dsp_adr;
+      for (int i = 0; i < 4; i++) srd[i] = g_spc_port_reads[i];
+      spcdat_total = g_spc_dsp_dat;
+      /* Estado de la CAPA DE VOCES: separa "el BRAM no tiene BRR" de "el BRR
+       * se decodifica a cero" de "la ganancia es 0" de "el volumen maestro es
+       * 0" de "el mezclador esta en mute". */
+      {
+        Dsp *vd = g_snes->apu->dsp;
+        unsigned bramNZ = 0; unsigned long long bramSum = 0;
+        for (unsigned i = 0; i < sizeof(g_snes->apu->ram); i++) {
+          uint8_t b = g_snes->apu->ram[i];
+          if (b) bramNZ++;
+          bramSum += b;
+        }
+        fprintf(stderr, "[dspvoice] f=%d master=%d/%d mute=%d reset=%d "
+                        "dirPage=%04X echoAdr=%04X echoDly=%u echoW=%d "
+                        "bramNZ=%u bramSum=%llu |",
+                (int)snes_frame_counter,
+                vd->masterVolumeL, vd->masterVolumeR,
+                vd->mute ? 1 : 0, vd->reset ? 1 : 0,
+                (unsigned)vd->dirPage, (unsigned)vd->echoBufferAdr,
+                (unsigned)vd->echoDelay, vd->echoWrites ? 1 : 0,
+                bramNZ, bramSum);
+        for (int ch = 0; ch < 8; ch++) {
+          fprintf(stderr, " c%d{srcn=%u gain=%u out=%d ko=%d kf=%d "
+                          "ad=%d pf=%d do=%u vol=%d/%d useG=%d dG=%d}",
+                  ch, (unsigned)vd->channel[ch].srcn,
+                  (unsigned)vd->channel[ch].gain,
+                  (int)vd->channel[ch].sampleOut,
+                  vd->channel[ch].keyOn ? 1 : 0,
+                  vd->channel[ch].keyOff ? 1 : 0,
+                  vd->channel[ch].adsrState,
+                  (unsigned)vd->channel[ch].previousFlags,
+                  (unsigned)vd->channel[ch].decodeOffset,
+                  (int)vd->channel[ch].volumeL, (int)vd->channel[ch].volumeR,
+                  vd->channel[ch].useGain ? 1 : 0,
+                  vd->channel[ch].directGain ? 1 : 0);
+        }
+        fprintf(stderr, "\n");
+      }
       /* Volcado del estado del DSP en un instante de reloj de INVITADO concreto
        * (portClock), para comparar dos configuraciones en el mismo punto de la
        * maquina y no en el mismo fotograma de host (que con la deadline activa

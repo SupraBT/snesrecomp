@@ -69,12 +69,41 @@ void apu_clearPortQueue(Apu* apu) {
  * invitado entrega su audio pero el DSP nunca lo ve (silencio con musica
  * sonando por dentro). */
 uint64_t g_apu_port_writes = 0;
+/* Escrituras del SPC700 a sus propios puertos ($F4-$F7) y al DSP ($F2/$F3).
+ * El hardware produce 11.002 / 3.095 / ~3,2 por fotograma; si aqui sale 0, el
+ * motor de sonido esta esperando una respuesta que nunca le llega. */
+uint64_t g_spc_port_w = 0;
+uint64_t g_spc_dsp_adr = 0;
+uint64_t g_spc_dsp_dat = 0;
 uint64_t g_apu_port_queue_max = 0;
 uint64_t g_apu_port_dropped = 0;
+
+/* PERDIDA DE BYTES EN LOS PUERTOS DE ENTRADA. Los puertos $F4-$F7 del SPC700
+ * son un unico registro de un byte: si el invitado escribe el byte N+1 antes de
+ * que el SPC700 lea el byte N, el N se pierde y no hay ningun aviso (la cola de
+ * eventos sigue vacia, porque la escritura anterior YA se aplico). El driver de
+ * sonido de Star Ocean transfiere ~7.460 bytes de golpe con $
+ * 2140, asi que basta un instante de desfase del SPC700 para corromper el BRAM
+ * entero y dejar el motor de sonido mudo. Este contador mide exactamente eso. */
+uint64_t g_inp_overwritten = 0;
+/* Lecturas de $F4-$F7 por el SPC700. El motor de sonido sano LEE el flujo de
+ * bytes a ritmo constante; si se estanca, el SPC esta aparcado en un bucle de
+ * espera y no esta leyendo nada. */
+uint64_t g_spc_port_reads[4] = {0, 0, 0, 0};
+/* HUELLA DEL FLUJO DE PUERTOS: FNV-1a sobre la secuencia (puerto, valor) de
+ * TODAS las escrituras que el invitado entrega al SPC700, en orden. Comparar la
+ *.huella acumulada en un frame de invitado dado entre dos configuraciones dice
+ * si el invitado entrego los MISMOS bytes, sin volcar 60.000 lineas. */
+uint64_t g_apu_stream_hash = 1469598103934665603ull;
+static uint8_t g_inp_dirty[4] = {0, 0, 0, 0};
 
 void apu_writePortNow(Apu* apu, uint8_t port, uint8_t val) {
   g_apu_port_writes++;
   port &= 3;
+  if (g_inp_dirty[port]) g_inp_overwritten++;
+  g_inp_dirty[port] = 1;
+  g_apu_stream_hash ^= (uint64_t)((port << 8) | val);
+  g_apu_stream_hash *= 1099511628211ull;
   apu->inPorts[port] = val;
   audio_trace_on_cpu_port_apply(port, val);
 }
@@ -267,6 +296,8 @@ uint8_t apu_cpuRead(Apu* apu, uint16_t adr) {
     case 0xf6:
     case 0xf7: {
       uint8_t v = apu->inPorts[adr - 0xf4];
+      g_spc_port_reads[adr - 0xf4]++;
+      g_inp_dirty[adr - 0xf4] = 0;
       audio_trace_on_spc_port_read((uint8_t)(adr - 0xf4), v);
 #if defined(SNESRECOMP_TRACE) && SNESRECOMP_TRACE
       if (getenv("SNESRECOMP_SPC_PORT_TRACE")) {
@@ -337,20 +368,24 @@ void apu_cpuWrite(Apu* apu, uint16_t adr, uint8_t val) {
       if(val & 0x10) {
         apu->inPorts[0] = 0;
         apu->inPorts[1] = 0;
+        g_inp_dirty[0] = g_inp_dirty[1] = 0;
       }
       if(val & 0x20) {
         apu->inPorts[2] = 0;
         apu->inPorts[3] = 0;
+        g_inp_dirty[2] = g_inp_dirty[3] = 0;
       }
       apu->romReadable = val & 0x80;
       break;
     }
     case 0xf2: {
       apu->dspAdr = val;
+      g_spc_dsp_adr++;
       break;
     }
     case 0xf3: {
       if(apu->dspAdr < 0x80) dsp_write(apu->dsp, apu->dspAdr, val);
+      g_spc_dsp_dat++;
       break;
     }
     case 0xf4:
@@ -359,6 +394,7 @@ void apu_cpuWrite(Apu* apu, uint16_t adr, uint8_t val) {
     case 0xf7: {
       audio_trace_on_spc_port_write((uint8_t)(adr - 0xf4), val);
       apu->outPorts[adr - 0xf4] = val;
+      g_spc_port_w++;
       break;
     }
     case 0xf8:
