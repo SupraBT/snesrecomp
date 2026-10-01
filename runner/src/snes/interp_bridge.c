@@ -229,6 +229,48 @@ static uint64_t hm_ns(void) {
 }
 #endif
 
+/* Volcado del flujo de LECTURAS de $2140-$2143 en el formato exacto de
+ * docs/traces/hw_r2140.tsv (el oraculo de Mesen), para contrastar motor
+ * contra hardware con tools/r2140_oracle.py.
+ *
+ * SNESRECOMP_R2140=<fichero> lo activa; SNESRECOMP_R2140_MAX=<n> pone el tope
+ * de lineas, porque este motor puede hacer millones de lecturas en un
+ * fotograma. Se anaden $4A y la condicion de salida del bucle porque el
+ * bucle NO se sale por el CMP: $C0:85A8 EOR $4A / $C0:85AA BPL $85CC cae en
+ * CLI/NOP/NOP/NOP/BRA $859D, que vuelve SIEMPRE. Salir exige que
+ * (A XOR $4A) tenga el bit 7, y sin ver esa bandera no se puede saber por
+ * que el motor no sale nunca y hardware sale. */
+extern uint32_t g_interp816_cur_pc;
+static FILE *g_r2140_log = NULL;
+static long long g_r2140_n = 0;
+static long long g_r2140_max = 0;
+static int g_r2140_tried = 0;
+static void bridge_r2140_dump(uint32_t adr, uint8_t val, CpuState *cpu) {
+    if (!g_r2140_tried) {
+        g_r2140_tried = 1;
+        const char *pth = getenv("SNESRECOMP_R2140");
+        if (pth && pth[0]) {
+            g_r2140_log = fopen(pth, "wb");
+            const char *mx = getenv("SNESRECOMP_R2140_MAX");
+            g_r2140_max = mx ? atoll(mx) : 2000000;
+            if (g_r2140_log)
+                fprintf(g_r2140_log, "# motor lecturas de $2140. fr	master	addr	val	pc	n	D4A	salta\n");
+            else
+                fprintf(stderr, "[r2140] no he podido abrir '%s'\n", pth);
+        }
+    }
+    if (!g_r2140_log || g_r2140_n >= g_r2140_max) return;
+    g_r2140_n++;
+    const uint8_t d4a = cpu_read8(cpu, 0, (uint16_t)(cpu->D + 0x4A));
+    fprintf(g_r2140_log, "%lld	%llu	%04X	%02X	%02X%04X	%lld	%02X	%d\n",
+            (long long)(cpu->master_cycles / 357368ull),
+            (unsigned long long)cpu->master_cycles,
+            (unsigned)(adr & 0xFFFF), (unsigned)val,
+            (unsigned)(g_interp816_cur_pc >> 16),
+            (unsigned)(g_interp816_cur_pc & 0xFFFF), g_r2140_n,
+            (unsigned)d4a, (unsigned)(((val ^ d4a) & 0x80) ? 1 : 0));
+}
+
 static uint8_t bridge_bus_read(void *mem, uint32_t adr) {
     CpuState *cpu = (CpuState *)mem;
     const uint64_t _bt0 = hm_ns();
@@ -242,6 +284,7 @@ static uint8_t bridge_bus_read(void *mem, uint32_t adr) {
         value=cpu_read8(cpu,(uint8)((adr>>16)&0xff),(uint16)adr);
         g_hm_apu_reads++;
         g_hm_apu_ns += hm_ns() - _t0;
+        bridge_r2140_dump(adr, value, cpu);
     } else
     value=cpu_read8(cpu,(uint8)((adr>>16)&0xff),(uint16)adr);
     if (continuous) {
