@@ -210,6 +210,12 @@ void audio_trace_on_cpu_port_write(uint8_t port, uint8_t val);
 void audio_trace_on_cpu_port_apply(uint8_t port, uint8_t val);
 void audio_trace_on_spc_port_read(uint8_t port, uint8_t val);
 void audio_trace_on_spc_port_write(uint8_t port, uint8_t val);
+
+/* Emisor de traza de eventos en formato Mesen (ver audio_trace.c). Lo llama
+ * el codigo que YA tiene el evento en la mano: el puente de puertos, el
+ * SPC700 y el DSP. Coste cero si no se pone SNESRECOMP_TRACE_EVENTS. */
+void audio_trace_emit(const char *kind, const char *src, unsigned addr,
+                      unsigned val, const char *nota);
 void audio_trace_on_cpu_port_read(uint8_t port, uint8_t val);
 
 /* Authoritative native-sample clocks (produced = samples the DSP has

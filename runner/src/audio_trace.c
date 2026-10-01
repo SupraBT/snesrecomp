@@ -460,3 +460,56 @@ int audio_trace_dump_wav(const char *path, int64_t start_idx, uint64_t count,
   if (out_count) *out_count = count;
   return 0;
 }
+
+/* ===========================================================================
+ * EMISOR DE TRAZA DE EVENTOS, EN EL FORMATO EXACTO DE MESEN.
+ *
+ * Por que existe. Durante mucho tiempo se ha comparado el recompilador con el
+ * hardware usando filas AGREGADAS por fotograma (una linea de la traza de
+ * Mesen frente a una linea [fstate]). Un agregado oculta todo lo que pasa
+ * ENTRE dos fotogramas, y es justo entre fotogramas donde estan los puertos de
+ * audio, que es lo que se estaba buscando. Con dos trazas de EVENTOS en el
+ * mismo formato se puede alinear una a una y decir "el evento 1.234.567 es el
+ * mismo y aqui diverge"; eso si es una verdad con parte de los dos lados.
+ *
+ * El formato es el de `*_so_trace_events.tsv`, separador TAB:
+ *
+ *     fr <TAB> master <TAB> src <TAB> kind <TAB> addr <TAB> val <TAB> nota
+ *
+ * `fr` y `master` son el frame de INVITADO y su reloj de master, NO los de
+ * host: sin la deadline de fotograma el invitado corre por delante y alinear
+ * por host compara instantes distintos de la maquina.
+ *
+ * Salida: SNESRECOMP_TRACE_EVENTS=<fichero>. Sin esa variable, este emisor no
+ * existe: una comprobacion estatica por llamada y un NULL.
+ * =========================================================================== */
+#include "cpu_state.h"
+extern CpuState g_cpu;
+extern int snes_frame_counter;
+struct Spc;
+extern struct Spc *g_spc_para_trace;
+
+static FILE *s_evt = NULL;
+static int   s_evt_tries = 0;
+
+static FILE *TrEmitFile(void) {
+  if (s_evt) return s_evt;
+  if (s_evt_tries++) return NULL;
+  const char *e = getenv("SNESRECOMP_TRACE_EVENTS");
+  if (!e || !e[0] || e[0] == '0') return NULL;
+  s_evt = fopen(e, "wb");
+  if (s_evt)
+    fprintf(s_evt, "# eventos del recompilador, formato Mesen: "
+                   "fr\tmaster\tsrc\tkind\taddr\tval\tnota\n");
+  return s_evt;
+}
+
+/* Una linea de evento. `nota` puede ser NULL. */
+void audio_trace_emit(const char *kind, const char *src, unsigned addr,
+                      unsigned val, const char *nota) {
+  FILE *f = TrEmitFile();
+  if (!f) return;
+  fprintf(f, "%d\t%llu\t%s\t%s\t%04X\t%02X\t%s\n", snes_frame_counter,
+          (unsigned long long)g_cpu.master_cycles, src, kind, addr, val,
+          nota ? nota : "");
+}

@@ -106,6 +106,9 @@ static uint8_t g_inp_dirty[4] = {0, 0, 0, 0};
 void apu_writePortNow(Apu* apu, uint8_t port, uint8_t val) {
   g_apu_port_writes++;
   port &= 3;
+  { extern void audio_trace_emit(const char *, const char *, unsigned, unsigned,
+                                 const char *);
+    audio_trace_emit("w214x", "cpu", 0x2140 + port, val, ""); }
   if (g_inp_dirty[port]) g_inp_overwritten++;
   g_inp_dirty[port] = 1;
   g_apu_stream_hash ^= (uint64_t)((port << 8) | val);
@@ -387,9 +390,19 @@ void apu_cpuWrite(Apu* apu, uint16_t adr, uint8_t val) {
     case 0xf2: {
       apu->dspAdr = val;
       g_spc_dsp_adr++;
+      { extern void audio_trace_emit(const char *, const char *, unsigned,
+                                     unsigned, const char *);
+        audio_trace_emit("sdsp_addr", "spc", 0x00F2, val, ""); }
       break;
     }
     case 0xf3: {
+      /* La nota lleva reg=XX, igual que la sonda de Mesen, para que las dos
+       * trazas se puedan alinear sin depender del latch de $F2. */
+      { extern void audio_trace_emit(const char *, const char *, unsigned,
+                                     unsigned, const char *);
+        char nota[16];
+        snprintf(nota, sizeof nota, "reg=%02X", apu->dspAdr);
+        audio_trace_emit("sdsp_data", "spc", 0x00F3, val, nota); }
       if(apu->dspAdr < 0x80) dsp_write(apu->dsp, apu->dspAdr, val);
       g_spc_dsp_dat++;
       break;
@@ -399,6 +412,9 @@ void apu_cpuWrite(Apu* apu, uint16_t adr, uint8_t val) {
     case 0xf6:
     case 0xf7: {
       audio_trace_on_spc_port_write((uint8_t)(adr - 0xf4), val);
+      { extern void audio_trace_emit(const char *, const char *, unsigned,
+                                     unsigned, const char *);
+        audio_trace_emit("w214x", "spc", 0x2140 + (adr - 0xf4), val, "spc"); }
       apu->outPorts[adr - 0xf4] = val;
       g_spc_port_w++;
       break;

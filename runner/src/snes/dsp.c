@@ -510,6 +510,17 @@ uint8_t dsp_read(Dsp* dsp, uint8_t adr) {
 
 void dsp_write(Dsp* dsp, uint8_t adr, uint8_t val) {
   audio_trace_on_reg_write(adr, val);
+  /* $4C/$5C son key-on / key-off. La sonda de Mesen los marca como `keyon`
+   * con reg=4C, y es el UNICO evento de la traza que dice cuando arranca una
+   * voz de verdad (los val=00 son key-off). Sin esto no se puede alinear el
+   * arranque de la musica con el hardware. */
+  if (adr == 0x4C || adr == 0x5C) {
+    extern void audio_trace_emit(const char *, const char *, unsigned, unsigned,
+                                 const char *);
+    char nota[16];
+    snprintf(nota, sizeof nota, "reg=%02X", adr);
+    audio_trace_emit("keyon", "spc", 0x00F3, val, nota);
+  }
   int ch = adr >> 4;
   switch(adr) {
     case 0x00: case 0x10: case 0x20: case 0x30: case 0x40: case 0x50: case 0x60: case 0x70: {
