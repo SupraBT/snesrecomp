@@ -95,6 +95,12 @@ uint64_t g_spc_port_reads[4] = {0, 0, 0, 0};
  *.huella acumulada en un frame de invitado dado entre dos configuraciones dice
  * si el invitado entrego los MISMOS bytes, sin volcar 60.000 lineas. */
 uint64_t g_apu_stream_hash = 1469598103934665603ull;
+/* ESCRITURAS AL BRAM POR PAGINA de 4 KiB. El IPL del SPC700 descomprime el
+ * motor de sonido dentro del BRAM; si esa subida se queda a medias, el motor
+ * arranca (hace su tick por frame) pero le faltan las tablas de secuencia y las
+ * muestras, y entonces: los SFX suenan, la musica no, y en el cambio de tema
+ * sale un chasquido de BRR basura. 16 contadores, uno por pagina. */
+uint64_t g_bram_page_w[16] = {0};
 static uint8_t g_inp_dirty[4] = {0, 0, 0, 0};
 
 void apu_writePortNow(Apu* apu, uint8_t port, uint8_t val) {
@@ -418,5 +424,6 @@ void apu_cpuWrite(Apu* apu, uint16_t adr, uint8_t val) {
     }
   }
 #endif
+  g_bram_page_w[adr >> 12]++;
   apu->ram[adr] = val;
 }

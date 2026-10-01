@@ -1412,6 +1412,25 @@ static void rtl_sync_apu_frame_boundary(void) {
     boundary = g_cpu.master_cycles * RTL_APU_RATIO_NUM / RTL_APU_RATIO_DEN;
   bool synced = apu_runToGuestCycle(g_snes->apu, boundary,
                                     1u << 20);
+  /* Cobertura del BRAM una vez, en un frame de HOST concreto
+   * (SNESRECOMP_BRAM_PAGE_AT), para ver si la subida del motor de sonido llego
+   * a todas las paginas de 4 KiB o se quedo a medias. */
+  { static int _bp = -1; static uint64_t _bp_at = 0; static int _bp_done = 0;
+    if (_bp < 0) {
+      const char *e = getenv("SNESRECOMP_BRAM_PAGE_AT");
+      _bp = (e && e[0] && e[0] != '0') ? 1 : 0;
+      _bp_at = e ? strtoull(e, NULL, 0) : 0;
+    }
+    if (_bp && !_bp_done && (uint64_t)snes_frame_counter >= _bp_at) {
+      extern uint64_t g_bram_page_w[16];
+      _bp_done = 1;
+      fprintf(stderr, "[brampg] f=%d ", (int)snes_frame_counter);
+      for (int i = 0; i < 16; i++)
+        fprintf(stderr, "%04X:%llu ", i * 0x1000,
+                (unsigned long long)g_bram_page_w[i]);
+      fprintf(stderr, "\n");
+    }
+  }
   { static int _ds = -1;
     static uint64_t _dump_at = 0;
     static int _dumped = 0;
