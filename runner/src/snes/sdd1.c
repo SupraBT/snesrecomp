@@ -21,11 +21,35 @@
  * decompression trace. Off by default — the trace writes megabytes per
  * second (Star Ocean decompresses hundreds of blocks per frame), so it is
  * only useful for focused diagnostics on a small number of frames. */
-#ifdef SNESRECOMP_INTERP_PROFILE
+/* Cronometro del descompresor del S-DD1.
+ *
+ * __rdtsc y no clock(): en Windows clock() tiene granularidad de milisegundo y
+ * un bloque tarda justo decenas de milisegundos, asi que clock() no puede ni
+ * repetir la medida ni separar dos bloques seguidos.
+ *
+ * Los contadores van SIEMPRE activos, no solo con SNESRECOMP_INTERP_PROFILE, por
+ * una razon concreta: el invitado aqui espera al S-DD1, pero el host lo paga
+ * descomprimiendo de verdad, y eso es el bajon de frames del arranque (pantalla
+ * en negro y menu de inicio a 48 FPS). Si el numero solo existiera en un build de
+ * perfil, el bug se mediria en un binario que nadie juega. El coste son dos
+ * rdtsc por bloque, sobre un bloque que ya cuesta miles de operaciones de bit.
+ * Lo que SI esta tras SNESRECOMP_PERF=1 es la impresion. */
+#include <intrin.h>
+#include <windows.h>
 uint64_t sdd1_prof_blocks = 0;
 uint64_t sdd1_prof_bytes = 0;
 double sdd1_prof_ms = 0.0;
-#endif
+uint64_t sdd1_prof_cycles = 0;
+static double sdd1_tsc_ms(uint64_t c) {
+    static double k = 0.0;
+    if (k == 0.0) { LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+                   k = 1000.0 / (double)f.QuadPart; }
+    return k * (double)c;
+}
+void sdd1_prof_reset(void) { sdd1_prof_blocks = sdd1_prof_bytes = 0; sdd1_prof_ms = 0.0; sdd1_prof_cycles = 0; }
+void sdd1_prof_get(uint64_t *blocks, uint64_t *bytes, double *ms) {
+    *blocks = sdd1_prof_blocks; *bytes = sdd1_prof_bytes; *ms = sdd1_prof_ms;
+}
 
 static int sdd1_debug_enabled(void) {
     static int v = -1;
@@ -470,9 +494,8 @@ static void sdd1_prepareDecomp(Sdd1Decomp *d) {
 
 static void sdd1_ol_launch(Sdd1Decomp *d, uint8_t *out_buf) {
     uint16_t length = d->length;
-#ifdef SNESRECOMP_INTERP_PROFILE
-    clock_t _t0 = clock();
-#endif
+    /* cronometro siempre activo, ver sdd1_prof_get */
+    uint64_t _t0 = __rdtsc();
 
     switch (d->bitplane_type) {
     case 0x00:
@@ -505,14 +528,12 @@ static void sdd1_ol_launch(Sdd1Decomp *d, uint8_t *out_buf) {
         break;
     }
     }
-#ifdef SNESRECOMP_INTERP_PROFILE
-    { extern uint64_t sdd1_prof_blocks, sdd1_prof_bytes;
-      extern double sdd1_prof_ms;
+    { uint64_t _dc = __rdtsc() - _t0;
       sdd1_prof_blocks++;
       sdd1_prof_bytes += d->length;
-      sdd1_prof_ms += 1000.0 * ((double)(clock() - _t0)) / CLOCKS_PER_SEC;
+      sdd1_prof_cycles += _dc;
+      sdd1_prof_ms += sdd1_tsc_ms(_dc);
     }
-#endif
 }
 
 /* ---- Whole-block decompression ---- */

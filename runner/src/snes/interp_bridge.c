@@ -316,13 +316,20 @@ static bool bridge_bus_read_word(void *mem, uint32_t adrl, uint32_t adrh,
     if (bridge_is_apu_port(adrl)) { _t1 = hm_ns(); bridge_apu_flush(cpu); }
     *out = cpu_read16(cpu, (uint8)((adrl >> 16) & 0xFF), (uint16)(adrl & 0xFFFF));
     if (_t1) { g_hm_apu_reads++; g_hm_apu_ns += hm_ns() - _t1; }
-    if (getenv("SNESRECOMP_APU_PORT_DIAG") && (uint16_t)adrl == 0x2140) {
-        static uint16_t last=0xffff; static unsigned reports;
-        if (*out!=last && reports++<256) {
-            fprintf(stderr,"[apu_port] read $2140=%04X pc-master=%llu pending=%llu\n",
-                    *out,(unsigned long long)cpu->master_cycles,
-                    (unsigned long long)s_apu_pending_master);
-            last=*out;
+    if (getenv("SNESRECOMP_APU_PORT_DIAG")) {
+        /* TODAS las lecturas, no solo los cambios: el handshake de $C0:859E
+         * (LDA $2140 / CMP $2140 / BNE) exige que DOS lecturas seguidas sin
+         * escritura en medio devuelvan el MISMO byte. Filtrar por cambio
+         * oculta justo el caso que importa. */
+        static unsigned nreads;
+        if (nreads < 4096) {
+            nreads++;
+            fprintf(stderr,
+                    "[apu_port] r $2140=%02X (w=%02X) master=%llu\n",
+                    (uint8_t)*out,
+                    (uint8_t)(cpu_read8(cpu, (uint8)((adrl >> 16) & 0xFF),
+                                        (uint16)(adrl & 0xFFFF))),
+                    (unsigned long long)cpu->master_cycles);
         }
     }
     /* Byte callbacks are bypassed for a claimed word. Treat any changed byte
