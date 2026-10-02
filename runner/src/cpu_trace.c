@@ -1270,6 +1270,20 @@ void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
     }
     if (g_freeze_capture) return;
     capture(cpu, pc24, CPU_TR_BLOCK, 0, 0);
+    /* Traza densa por BLOQUE del estado del invitado (SO_BLOCKTRACE=<fichero>).
+     * Este es el UNICO sitio por el que pasa el 100% de las fronteras de bloque
+     * basico: el codigo AOT genera una llamada a cpu_trace_block() en cada una,
+     * con el estado ANTES de ejecutar el bloque (el mismo instante que samplea
+     * el oraculo por instruccion). `cpu_dispatch_pc_from` NO sirve aqui: solo
+     * atende trampolines RTS/RTL y llamadas indirectas, no el camino caliente.
+     * Ver blocktrace.c y DESCARTADAS.md §29. */
+    { extern void blocktrace_emit(CpuState *cpu, uint32_t pc24);
+#if SNESRECOMP_BLOCKTRACE
+      blocktrace_emit(cpu, pc24);
+#else
+      (void)blocktrace_emit;
+#endif
+    }
 #if SNESRECOMP_TRACE
     dbg_oam_block_trace(cpu, pc24);  /* task #7 PC-range block path trace */
 #endif

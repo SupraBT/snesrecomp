@@ -999,6 +999,13 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     in.write_word = bridge_bus_write_word;
     in.brkHookEnabled = true;
     const int wlog_state_sync = getenv("SNESRECOMP_WLOG_STATE") != NULL;
+#if SNESRECOMP_BLOCKTRACE
+    /* SO_BLOCKTRACE necesita lo mismo: los registros del interprete viven en el
+     * struct local `in` y solo se publican a `cpu` en los limites del puente, asi
+     * que sin esta sincronizacion la traza por instruccion leeria valores
+     * rancios. */
+    const int blocktrace_sync = getenv("SO_BLOCKTRACE") != NULL;
+#endif
 
     sync_cpu_to_interp(cpu, &in);
     in.k  = (uint8)((entry_pc24 >> 16) & 0xFF);
@@ -1958,7 +1965,11 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
          * local Interp816 struct until a bridge boundary.  Publish the pre-op
          * state so an address write-log can compare the exact store-site
          * registers against AOT.  Completely inert unless explicitly armed. */
-        if (wlog_state_sync) {
+        if (wlog_state_sync
+#if SNESRECOMP_BLOCKTRACE
+            || blocktrace_sync
+#endif
+           ) {
             g_interp_wlog_pc24 = pc_before & 0xFFFFFFu;
             sync_interp_to_cpu(&in, cpu);
         }
@@ -1969,6 +1980,18 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
         }
         uint64_t _op_t = 0;
         if (g_hm_stat_on) { g_hm_ops++; _op_t = hm_ns(); }
+        /* Traza densa del estado del invitado por INSTRUCCION (SO_BLOCKTRACE).
+         * Este es el bucle real del LLE: la Opcode que se va a ejecutar, con el
+         * estado ya sincronizado a `cpu` en el instante previo — exactamente el
+         * mismo punto que samplea la traza de Mesen por instruccion, que es lo
+         * que hace a los dos lados comparables. `cpu_trace_block` NO sirve: el
+         * codigo AOT no entra en juego durante el arranque (se mide 0 llamadas),
+         * asi que el unico sitio con cobertura real es aqui.
+         * Ver blocktrace.c y DESCARTADAS.md §29. */
+        #if SNESRECOMP_BLOCKTRACE
+        { extern void blocktrace_emit(CpuState *cpu, uint32_t pc24);
+          blocktrace_emit(cpu, pc_before & 0xFFFFFFu); }
+#endif
         int _cyc = interp816_runOpcode(&in);   /* executes the opcode; pushes/pops frames */
         if (g_hm_stat_on) g_hm_op_ns += hm_ns() - _op_t;
         s_interp_bus_timing_active=0;

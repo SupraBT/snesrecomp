@@ -95,6 +95,7 @@ set(SNESRECOMP_RUNNER_SOURCES
     ${SNESRECOMP_RUNNER_ROOT}/src/keybinds.c
     ${SNESRECOMP_RUNNER_ROOT}/src/cpu_state.c
     ${SNESRECOMP_RUNNER_ROOT}/src/cpu_trace.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/blocktrace.c
     ${SNESRECOMP_RUNNER_ROOT}/src/audio_trace.c
     ${SNESRECOMP_RUNNER_ROOT}/src/ppu_dma_trace.c
     ${SNESRECOMP_RUNNER_ROOT}/src/host_report.c
