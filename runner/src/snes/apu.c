@@ -86,6 +86,14 @@ uint64_t g_apu_port_dropped = 0;
  * 2140, asi que basta un instante de desfase del SPC700 para corromper el BRAM
  * entero y dejar el motor de sonido mudo. Este contador mide exactamente eso. */
 uint64_t g_inp_overwritten = 0;
+/* ULTIMO valor que el invitado escribio en cada puerto $2140-$2143, y cuantos
+ * bytes ha puesto en cada uno. El log de eventos por bajon de FPS (evlog.c)
+ * necesita esto POR FOTOGRAMA, y muestrear el valor "actual" una vez por
+ * fotograma no sirve: entre dos muestras el invitado puede haber escrito
+ * cientos de veces y el valor que se veria no seria el ultimo. Se actualiza
+ * aqui, en el punto de entrega, que es el unico sitio donde es cierto. */
+uint8_t  g_apu_last_port_w[4] = {0, 0, 0, 0};
+uint64_t g_apu_port_wcount[4] = {0, 0, 0, 0};
 /* Lecturas de $F4-$F7 por el SPC700. El motor de sonido sano LEE el flujo de
  * bytes a ritmo constante; si se estanca, el SPC esta aparcado en un bucle de
  * espera y no esta leyendo nada. */
@@ -106,6 +114,8 @@ static uint8_t g_inp_dirty[4] = {0, 0, 0, 0};
 void apu_writePortNow(Apu* apu, uint8_t port, uint8_t val) {
   g_apu_port_writes++;
   port &= 3;
+  g_apu_last_port_w[port] = val;
+  g_apu_port_wcount[port]++;
   { extern void audio_trace_emit(const char *, const char *, unsigned, unsigned,
                                  const char *);
     audio_trace_emit("w214x", "cpu", 0x2140 + port, val, ""); }
@@ -254,6 +264,35 @@ void apu_cycle(Apu* apu) {
      * instruction we're about to execute, not the post-opcode PC. */
     g_spc_pc_histogram[apu->spc->pc]++;
     if (apu->spc->pc > g_spc_pc_max_seen) g_spc_pc_max_seen = apu->spc->pc;
+    /* SNESRECOMP_SPCEXEC=1 traza el flujo de opcodes del SPC dentro de una
+     * ventana de fotogramas, para poder desensamblar EN VIVO el bucle en el que
+     * se atasca en vez de suponerlo. SNESRECOMP_SPCEXEC_FROM/TO acotan la
+     * ventana y SNESRECOMP_SPCEXEC_MAX corta el volcado. */
+    { static int _se = -1; static unsigned long _sn = 0;
+      static int _from = 0, _to = 0; static unsigned long _max = 200000;
+      extern int snes_frame_counter;
+      if (_se < 0) {
+        const char *e = getenv("SNESRECOMP_SPCEXEC");
+        _se = (e && e[0] && e[0] != '0') ? 1 : 0;
+        const char *f = getenv("SNESRECOMP_SPCEXEC_FROM");
+        const char *t = getenv("SNESRECOMP_SPCEXEC_TO");
+        const char *m = getenv("SNESRECOMP_SPCEXEC_MAX");
+        _from = f ? atoi(f) : 0;
+        _to = t ? atoi(t) : 0x7fffffff;
+        if (m) _max = strtoul(m, NULL, 10);
+      }
+      if (_se && snes_frame_counter >= _from && snes_frame_counter <= _to
+          && _sn < _max) {
+        _sn++;
+        fprintf(stderr, "[spcexec] f=%d pc=%04X op=%02X a=%02X x=%02X y=%02X sp=%02X p=%d\n",
+                snes_frame_counter,
+                (unsigned)apu->spc->pc,
+                (unsigned)spc_peek_opcode(apu->spc),
+                (unsigned)apu->spc->a, (unsigned)apu->spc->x,
+                (unsigned)apu->spc->y, (unsigned)apu->spc->sp,
+                apu->spc->p ? 1 : 0);
+      }
+    }
     apu->cpuCyclesLeft = spc_runOpcode(apu->spc);
   }
   apu->cpuCyclesLeft--;
@@ -329,6 +368,33 @@ uint8_t apu_cpuRead(Apu* apu, uint16_t adr) {
     case 0xff: {
       uint8_t ret = apu->timer[adr - 0xfd].counter;
       apu->timer[adr - 0xfd].counter = 0;
+      /* SNESRECOMP_T0OUT=1 traza CADA lectura de $FD/$FE/$FF (T0/T1/T2OUT).
+       * Motivo (§22.29): el IPL del SPC700 no lee $FD en ningun byte de sus 64,
+       * asi que el borrado del contador al leer $FD solo puede afectar al
+       * motor de sonido YA SUBIDO (BRAM), no al IPL. Sin este traza no se
+       * puede distinguir "el motor no sondea $FD" de "el motor lo sondea y lee
+       * siempre 0". Se loguea el valor DEVUELTO, que es el que ve el codigo. */
+      { static int _t0 = -1; static uint64_t _n = 0;
+        static uint64_t _last_ticks = 0;
+        if (_t0 < 0) { const char *e = getenv("SNESRECOMP_T0OUT");
+                       _t0 = (e && e[0] && e[0] != '0') ? 1 : 0; }
+        if (_t0) {
+          extern uint64_t g_apu_timer0_total_ticks;
+          uint64_t now = g_apu_timer0_total_ticks;
+          if (_n++ < 4000000)
+            fprintf(stderr,
+                    "[t0out] pc=%04X reg=%02X val=%02X ticks=%llu dTicks=%llu "
+                    "target=%02X divider=%02X en=%d clock=%llu\n",
+                    apu->spc->pc, adr, ret,
+                    (unsigned long long)now,
+                    (unsigned long long)(now - _last_ticks),
+                    (unsigned)apu->timer[0].target,
+                    (unsigned)apu->timer[0].divider,
+                    apu->timer[0].enabled ? 1 : 0,
+                    (unsigned long long)apu->portClock);
+          _last_ticks = now;
+        }
+      }
       return ret;
     }
   }

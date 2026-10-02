@@ -131,6 +131,13 @@ static uint8_t spc_readOpcode(Spc* spc) {
   return spc_read(spc, spc->pc++);
 }
 
+/* Lee el opcode en el PC SIN avanzar el PC. Lo usa la traza [spcexec] de
+ * apu.c para poder desensamblar en vivo el bucle en el que se atasca el SPC.
+ * No altera el estado: spc_read es puro. */
+uint8_t spc_peek_opcode(Spc* spc) {
+  return spc_read(spc, spc->pc);
+}
+
 static uint16_t spc_readOpcodeWord(Spc* spc) {
   uint8_t low = spc_readOpcode(spc);
   return low | (spc_readOpcode(spc) << 8);

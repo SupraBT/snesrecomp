@@ -39,6 +39,9 @@ Spc* spc_init(Apu* apu);
 void spc_free(Spc* spc);
 void spc_reset(Spc* spc);
 int spc_runOpcode(Spc* spc);
+
+/* Opcode en el PC sin avanzar el PC (traza [spcexec] de apu.c). */
+uint8_t spc_peek_opcode(Spc* spc);
 void spc_saveload(Spc *spc, SaveLoadInfo *sli);
 
 #endif

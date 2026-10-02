@@ -1431,6 +1431,52 @@ static void rtl_sync_apu_frame_boundary(void) {
       fprintf(stderr, "\n");
     }
   }
+  /* Diagnostico del LADO DEL SPC durante el handshake $2140/$4A.
+   *
+   * POR QUE. Con la deadline de fotograma activa el invitado escribe
+   * $2140=$AA (magia de arranque del IPL del SPC700) en f393 y se queda
+   * releendo $2140 para siempre: el handshake nunca se completa, el motor de
+   * sonido no vuelve a escribir al DSP y el anillo cae a silencio (la musica
+   * arranca en f786 en vez de f328). El SPC, por su parte, se queda sondeando
+   * $FD (T0OUT) esperando que su TIMER 0 llegue a cero-para-leer.
+   *
+   * QUE MIDE, para separar las DOS causas que son excluyentes:
+   *   target/divider/counter/enabled -> si el valor que el invitado escribio en
+   *       $2140/$2141 LLEGA al registro del temporizador (fallo de entrega), o
+   *   ticks                        -> si el reloj del temporizador AVANZA.
+   *   outPorts                     -> si el SPC llega a poner $AA/$BB, que es
+   *       lo que el invitado espera leer para seguir.
+   *
+   * SNESRECOMP_SPCTIMER=1 lo activa; SNESRECOMP_SPCTIMER_FROM=<n> acota la
+   * ventana (por defecto imprime siempre). Vive en su propia linea para no
+   * tocar el formato de [dspstat], que leen otras herramientas. */
+  { static int _st = -1;
+    static int _st_from = 0;
+    if (_st < 0) { const char *e = getenv("SNESRECOMP_SPCTIMER");
+                   _st = (e && e[0] && e[0] != '0') ? 1 : 0;
+                   const char *f = getenv("SNESRECOMP_SPCTIMER_FROM");
+                   _st_from = f ? atoi(f) : 0; }
+    if (_st && g_snes && g_snes->apu && (int)snes_frame_counter >= _st_from) {
+      extern uint64_t g_apu_timer0_total_ticks;
+      extern uint64_t g_spc_dsp_dat;
+      Apu *a = g_snes->apu;
+      fprintf(stderr,
+              "[spctimer] f=%d spcPC=%04X t0{target=%02X divider=%02X "
+              "counter=%02X en=%d} ticks=%llu out=%02X%02X%02X%02X "
+              "in=%02X%02X%02X%02X portClock=%llu dspW=%llu\n",
+              (int)snes_frame_counter,
+              (unsigned)(g_snes->apu->spc ? g_snes->apu->spc->pc : 0),
+              (unsigned)a->timer[0].target, (unsigned)a->timer[0].divider,
+              (unsigned)a->timer[0].counter, a->timer[0].enabled ? 1 : 0,
+              (unsigned long long)g_apu_timer0_total_ticks,
+              (unsigned)a->outPorts[0], (unsigned)a->outPorts[1],
+              (unsigned)a->outPorts[2], (unsigned)a->outPorts[3],
+              (unsigned)a->inPorts[0], (unsigned)a->inPorts[1],
+              (unsigned)a->inPorts[2], (unsigned)a->inPorts[3],
+              (unsigned long long)a->portClock,
+              (unsigned long long)g_spc_dsp_dat);
+    }
+  }
   { static int _ds = -1;
     static uint64_t _dump_at = 0;
     static int _dumped = 0;
